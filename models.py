@@ -20,6 +20,7 @@ class WorkflowStep:
     step_id: str
     order: int
     name: str
+    goal: str          # why this step is needed
     description: str
     capability: str
     input_data: dict[str, Any]
@@ -31,6 +32,7 @@ class WorkflowStep:
         cls,
         order: int,
         name: str,
+        goal: str,
         description: str,
         capability: str,
         input_data: dict[str, Any],
@@ -41,6 +43,7 @@ class WorkflowStep:
             step_id=str(uuid.uuid4()),
             order=order,
             name=name,
+            goal=goal,
             description=description,
             capability=capability,
             input_data=input_data,
@@ -53,6 +56,7 @@ class WorkflowStep:
             "step_id": self.step_id,
             "order": self.order,
             "name": self.name,
+            "goal": self.goal,
             "description": self.description,
             "capability": self.capability,
             "input_data": self.input_data,
