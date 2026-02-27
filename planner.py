@@ -56,6 +56,16 @@ Rules:
   an ISO 8601 UTC timestamp and must be in the future vs CURRENT_UTC.
 - If no suitable capabilities are available for part of the goal, note it \
   in the description and skip that step.
+- MANDATORY FINAL STEP: The very last step of every plan MUST send a completion
+  response back to the requester. Use an available messaging or notification
+  capability (e.g. send_message, reply_message, slack_reply, send_reply, or
+  similar) to notify the requester that the workflow finished and summarise what
+  was accomplished. The message must be delivered to the same channel and
+  conversation thread as the original request — use the REPLY_CHANNEL_ID and
+  REPLY_THREAD_ID values from the request context when provided (pass them as
+  channel_id and thread_id in input_data). If no messaging capability is
+  available, use capability="send_response" and document the intended message in
+  input_data.message.
 """
 
 
@@ -127,6 +137,8 @@ class TaskPlanner:
         for agent in agents:
             agent_name = agent.get("name", "unknown")
             if agent_name in skip_agents:
+                continue
+            if agent.get("disabled"):
                 continue
             for cap in agent.get("capabilities", []):
                 if isinstance(cap, dict):
@@ -218,10 +230,19 @@ class TaskPlanner:
                 input_data["scheduled_at"],
             )
 
-    async def plan(self, goal: str, requester_id: str) -> WorkflowPlan:
+    async def plan(
+        self,
+        goal: str,
+        requester_id: str,
+        channel_id: str = "",
+        thread_id: str = "",
+    ) -> WorkflowPlan:
         """
         Generate a WorkflowPlan for *goal* using a single Anthropic API call.
         Capabilities are fetched from the orchestrator (cached, TTL 60 s).
+
+        channel_id / thread_id identify where the completion response must be
+        sent (the same channel and conversation thread as the original request).
         """
         agents = await self.discover_capabilities()
         caps_text = self._format_capabilities(agents)
@@ -232,12 +253,22 @@ class TaskPlanner:
             goal[:80], len(agents),
         )
 
+        reply_context_lines: list[str] = [f"REQUESTER_ID: {requester_id}"]
+        if channel_id:
+            reply_context_lines.append(f"REPLY_CHANNEL_ID: {channel_id}")
+        if thread_id:
+            reply_context_lines.append(f"REPLY_THREAD_ID: {thread_id}")
+        reply_context = "\n".join(reply_context_lines)
+
         user_msg = (
             f"CURRENT_UTC: {self._iso_utc(now_utc)}\n\n"
+            f"Request context:\n{reply_context}\n\n"
             f"Goal: {goal}\n\n"
             f"Available agent capabilities:\n{caps_text}\n\n"
             "Create a workflow plan to accomplish this goal. "
-            "Include a clear goal for each step."
+            "Include a clear goal for each step. "
+            "Remember: the FINAL step must always send a completion response "
+            "back to the requester on the same channel and thread."
         )
 
         # ── Single LLM call ──────────────────────────────────────────────────
@@ -275,7 +306,8 @@ class TaskPlanner:
             requester_id=requester_id,
         )
         logger.info(
-            "Plan created: task_id=%s  title=%r  steps=%d",
+            "Plan created: task_id=%s  title=%r  steps=%d\n%s",
             plan.task_id, plan.title, len(steps),
+            json.dumps(plan.to_dict(), indent=2),
         )
         return plan

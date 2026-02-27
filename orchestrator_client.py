@@ -90,6 +90,55 @@ def _resolve_step_refs(value: Any, outputs: list[Optional[dict]]) -> Any:
     return value
 
 
+def _clean_text(value: Any) -> str:
+    """Return a stripped string for optional request fields."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _normalise_step_input(capability: str, input_data: dict[str, Any]) -> dict[str, Any]:
+    """Map common alias fields to capability-specific input fields."""
+    if capability != "send_slack_message":
+        return input_data
+
+    normalised = dict(input_data)
+    # Planner prompt asks for channel_id/thread_id context; Slack capability
+    # expects channel/thread_ts.
+    if not normalised.get("channel"):
+        channel_id = normalised.get("channel_id")
+        if isinstance(channel_id, str) and channel_id.strip():
+            normalised["channel"] = channel_id.strip()
+
+    if not normalised.get("thread_ts"):
+        thread_id = normalised.get("thread_id")
+        if isinstance(thread_id, str) and thread_id.strip():
+            normalised["thread_ts"] = thread_id.strip()
+
+    return normalised
+
+
+def _inject_slack_user_id(steps: list[dict[str, Any]], user_id: str) -> None:
+    """Best-effort propagation of Slack user_id into slack send steps."""
+    if not user_id:
+        return
+    for step in steps:
+        capability = step.get("capability")
+        input_data = step.get("input_data")
+        if not isinstance(input_data, dict):
+            continue
+        if capability == "send_slack_message":
+            input_data.setdefault("user_id", user_id)
+            continue
+        if capability == "schedule_task":
+            nested_cap = input_data.get("capability")
+            nested_data = input_data.get("input_data")
+            if nested_cap == "send_slack_message" and isinstance(nested_data, dict):
+                nested_data.setdefault("user_id", user_id)
+
+
 # ── Agent identity ─────────────────────────────────────────────────────────────
 
 AGENT_NAME        = "task-planner-agent"
@@ -120,6 +169,18 @@ REGISTRATION_PAYLOAD: dict = {
                     "goal": {
                         "type": "string",
                         "description": "Natural-language description of the task to plan and execute.",
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel identifier to send the completion response back to.",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Slack user id for DM fallback delivery (e.g. U0123...).",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Conversation thread identifier to reply into when the workflow completes.",
                     },
                 },
                 "required": ["goal"],
@@ -312,6 +373,9 @@ class OrchestratorClient:
                         await self._register()
                     except Exception as reg_exc:
                         logger.error("Re-registration failed: %s", reg_exc)
+                elif code == 4003:
+                    logger.info("Agent is disabled by orchestrator (4003) — will retry so dashboard enable can restore connection")
+                    backoff = max(backoff, 10.0)
                 elif self._shutting_down:
                     break
                 else:
@@ -501,7 +565,22 @@ class OrchestratorClient:
     async def _cap_plan_task(
         self, input_data: dict, requester_id: str, ws
     ) -> tuple[dict | None, str | None]:
-        goal = input_data.get("goal", "").strip()
+        goal       = _clean_text(input_data.get("goal"))
+        channel_id = _clean_text(input_data.get("channel_id"))
+        user_id    = _clean_text(input_data.get("user_id"))
+        thread_id  = _clean_text(input_data.get("thread_id"))
+        payload = input_data.get("payload")
+        if isinstance(payload, dict):
+            if not channel_id:
+                channel_id = _clean_text(payload.get("channel_id"))
+            if not user_id:
+                user_id = _clean_text(payload.get("user_id"))
+            if not thread_id:
+                # Slack sends thread_ts; planner uses thread_id semantics.
+                thread_id = (
+                    _clean_text(payload.get("thread_id"))
+                    or _clean_text(payload.get("thread_ts"))
+                )
         if not goal:
             return None, "input_data.goal is required"
         if not self._planner:
@@ -509,12 +588,17 @@ class OrchestratorClient:
 
         # ── Single LLM call ──────────────────────────────────────────────────
         try:
-            plan: WorkflowPlan = await self._planner.plan(goal, requester_id)
+            plan: WorkflowPlan = await self._planner.plan(
+                goal, requester_id,
+                channel_id=channel_id,
+                thread_id=thread_id,
+            )
         except Exception as exc:
             logger.error("Planning failed: %s", exc)
             return None, f"Planning failed: {exc}"
 
         steps = [s.to_dict() for s in plan.steps]
+        _inject_slack_user_id(steps, user_id)
         logger.info("Plan ready: task_id=%s  title=%r  steps=%d",
                     plan.task_id, plan.title, len(steps))
 
@@ -580,6 +664,8 @@ class OrchestratorClient:
 
         # Resolve {{steps[N].output.field}} references
         input_data = _resolve_step_refs(step.get("input_data", {}), outputs)
+        if isinstance(input_data, dict):
+            input_data = _normalise_step_input(capability, input_data)
 
         # Discover target agent (cached)
         target_agent_id = step.get("target_agent_id") or await self._discover_best(capability)
@@ -791,7 +877,7 @@ class OrchestratorClient:
     async def _cap_get_workflow_status(
         self, input_data: dict
     ) -> tuple[dict | None, str | None]:
-        task_id = input_data.get("task_id", "").strip()
+        task_id = _clean_text(input_data.get("task_id"))
         if not task_id:
             return None, "input_data.task_id is required"
         wf = await asyncio.to_thread(self._store.get_workflow, task_id)
