@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # ── Capability cache TTL ───────────────────────────────────────────────────────
 _CAPS_CACHE_TTL_S: float = 60.0   # re-fetch agents at most once per minute
+_COMPACT_CAP_LIMIT: int = 10
+_MAX_OPTIONAL_FIELDS_PER_CAP: int = 2
+_MAX_MEMORY_CONTEXT_CHARS: int = 1200
 
 _PLAN_SYSTEM_PROMPT = """\
 You are a workflow planning AI. Given a task description and a list of \
@@ -40,10 +43,22 @@ Your output must be valid JSON in exactly this format (no extra text):
       "capability": "exact_capability_name_from_available_list",
       "input_data": { "key": "value" }
     }
+  ],
+  "memory_entries": [
+    { "category": "Facts|Preferences|Patterns|Instructions", "content": "One concise fact about the user worth remembering" }
   ]
 }
 
 Rules:
+- Interpreting conversation context (read this first): When the request arrives as a
+  multi-turn conversation (prior assistant questions followed by a user reply), ALWAYS
+  read the assistant's previous message to understand what was asked before interpreting
+  the user's reply. Explicitly map each part of the user's answer to the question that
+  prompted it. For example: if the prior message asked "What car do you drive?" and the
+  user replied "Tesla", the resolved meaning is "the user drives a Tesla" — use THAT
+  meaning when planning, not the raw word "Tesla". Apply this same principle to all
+  answers: short, single-word, or list replies only make sense relative to the question
+  that preceded them. Never treat a contextual reply as an ambiguous standalone goal.
 - Only use capabilities that appear in the provided list.
 - Each step must have concrete, non-placeholder input_data values.
 - Each step must have a clear goal explaining its purpose in the overall plan.
@@ -56,6 +71,22 @@ Rules:
   an ISO 8601 UTC timestamp and must be in the future vs CURRENT_UTC.
 - If no suitable capabilities are available for part of the goal, note it \
   in the description and skip that step.
+- Cost awareness: Each capability includes an estimated cost per call. When multiple \
+  capabilities can accomplish the same sub-goal with equivalent quality, prefer the \
+  lower-cost option. Never sacrifice output quality or completeness for cost savings — \
+  always use the best-fit capability for the task. Free capabilities carry no cost \
+  penalty. High-cost capabilities (e.g. browse_web ~$0.0150) should only be used when \
+  no cheaper alternative (e.g. serper_search ~$0.0010) can adequately fulfil the step.
+- Formatting step outputs for Slack: NEVER hardcode field references like
+  {{steps[N].output.results[0].title}} in send_slack_message text. Instead,
+  insert a format_step_output step immediately before the send_slack_message
+  step:
+    • input_data.data: {{steps[N].output}}  (whole output of the data step; N is its 0-based index)
+    • input_data.capability_name: exact capability name of step N (e.g. "serper_search")
+  The send_slack_message step that follows uses {{steps[K].output.text}} as
+  its text, where K is the 0-based index of the format_step_output step.
+  Only use format_step_output when the results will be shown to a user in
+  Slack.  Skip it for intermediate data steps whose output feeds another step.
 - MANDATORY FINAL STEP: The very last step of every plan MUST send a completion
   response back to the requester. Use an available messaging or notification
   capability (e.g. send_message, reply_message, slack_reply, send_reply, or
@@ -66,6 +97,70 @@ Rules:
   channel_id and thread_id in input_data). If no messaging capability is
   available, use capability="send_response" and document the intended message in
   input_data.message.
+- Memory entries (optional, max 3): The "memory_entries" key may contain facts
+  about the USER worth storing for future personalization. Only include stable,
+  reusable information — preferences, standing facts, recurring patterns, or
+  explicit instructions. Do NOT store transient task details. Each entry needs
+  "category" (Facts/Preferences/Patterns/Instructions) and "content" (one
+  concise phrase, no leading dash). Omit "memory_entries" entirely if nothing
+  is worth storing. If prior memory context is provided, use it to avoid storing
+  duplicates and to inform plan personalization.
+- Memory query goals: If the goal asks what you know about the user (e.g. "Do
+  you know what car I drive?") and the memory context does NOT contain the
+  answer, create a single-step plan that sends a message to the user explaining
+  you don't have that information yet and inviting them to share it (e.g. "I
+  don't have your car saved yet — just reply with your car make/model and I'll
+  remember it for next time."). If the memory DOES contain the answer, create
+  a single-step plan that reports it back to the user.
+- Storing user-provided personal info: If the conversation context (especially
+  from a prior clarification exchange) reveals the user has provided a personal
+  fact (e.g. they answered "Tesla" to "What car do you drive?"), treat this as
+  a memory-store request. Create a plan with ONE step: send a confirmation
+  message (e.g. "Got it! I've noted that you drive a Tesla."). Include the fact
+  in memory_entries so it is persisted. Do NOT perform unrelated tasks or
+  research with the provided info — just store it and confirm.
+"""
+
+
+_CLARIFICATION_SYSTEM_PROMPT = """\
+You are a workflow planning assistant. Assess whether the goal is clear enough \
+to create a detailed, accurate workflow plan without further input.
+
+Output JSON in exactly one of these formats (no extra text):
+
+If the goal is clear:
+{"needs_clarification": false}
+
+If important details are missing or ambiguous:
+{
+  "needs_clarification": true,
+  "questions": ["Question 1?", "Question 2?"],
+  "understood_as": "One-line restatement of what was understood"
+}
+
+Rules:
+- Interpreting prior-question replies (read this first): If the context includes
+  conversation history — prior assistant questions followed by a user reply — read the
+  assistant's questions BEFORE assessing the user's reply. Resolve each answer against
+  the question that prompted it. A short reply (e.g. "Tesla", "yes", "next Friday") is
+  NOT ambiguous when a prior question makes its meaning clear (e.g. "What car do you
+  drive?"). In such cases, treat the meaning as resolved and output
+  needs_clarification: false. Do NOT ask again for information the user has already
+  provided in this exchange.
+- Maximum 3 questions. Ask ONLY when truly needed — missing targets, ambiguous \
+  scope, conflicting constraints. Do NOT ask about things that can be inferred.
+- For self-contained, unambiguous goals output needs_clarification: false.
+- If available capabilities make the goal clearly achievable, output false.
+- If personalisation memory context is provided, treat it as confirmed facts about
+  this user. Do NOT ask questions whose answers are already present in the memory.
+  If the memory supplies the missing detail, proceed with needs_clarification: false.
+  Only ask when information is genuinely absent from both the goal AND the memory.
+- IMPORTANT: If the goal is a question about what information you have about the
+  user (e.g. "Do you know what car I drive?", "Do you know my name?", "What do you
+  know about me?"), do NOT ask the user to provide that information. Output
+  needs_clarification: false. The planner will check memory and respond
+  appropriately — either confirming what it knows or asking the user to share it
+  as part of the workflow response.
 """
 
 
@@ -93,6 +188,93 @@ class TaskPlanner:
         if self._api_key:
             kwargs["api_key"] = self._api_key
         return anthropic.Anthropic(**kwargs)
+
+    async def fetch_memory_context(self, user_id: str = "") -> str:
+        """
+        Fetch Cortex memory to inject into the planning prompt.
+        Pulls global memory and (if user_id is provided) user-specific memory.
+        Fails silently — memory is advisory context, never critical.
+        """
+        parts: list[str] = []
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                # Global memory — facts/prefs visible to all agents
+                try:
+                    r = await http.get(f"{self._base}/api/v1/cortex/global")
+                    if r.status_code == 200:
+                        content = r.json().get("content", "").strip()
+                        if content and "## " in content:
+                            parts.append(f"=== Global Memory ===\n{content}")
+                except Exception as exc:
+                    logger.debug("Could not fetch global Cortex memory: %s", exc)
+
+                # User-specific memory (keyed by Slack user_id if available)
+                if user_id:
+                    namespace = f"slack-user-{user_id}"
+                    try:
+                        r = await http.get(
+                            f"{self._base}/api/v1/cortex/agents/{namespace}"
+                        )
+                        if r.status_code == 200:
+                            content = r.json().get("content", "").strip()
+                            if content and "## " in content:
+                                parts.append(
+                                    f"=== User Memory (id: {user_id}) ===\n{content}"
+                                )
+                    except Exception as exc:
+                        logger.debug("Could not fetch user Cortex memory: %s", exc)
+        except Exception as exc:
+            logger.debug("Memory context fetch failed: %s", exc)
+
+        return "\n\n".join(parts)
+
+    async def write_memory_entries(
+        self,
+        user_entries: list[dict],
+        user_id: str = "",
+        planner_entries: list[dict] | None = None,
+    ) -> None:
+        """
+        Write memory entries to the user namespace and/or the planner namespace.
+        All writes are best-effort — failures are logged and silently ignored.
+        user_entries: [{category, content}] → written to slack-user-{user_id}
+        planner_entries: [{category, content}] → written to task-planner-agent
+        """
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            if user_id and user_entries:
+                namespace = f"slack-user-{user_id}"
+                for entry in user_entries:
+                    try:
+                        await http.post(
+                            f"{self._base}/api/v1/cortex/agents/{namespace}/entries",
+                            json={
+                                "category": entry.get("category", "Facts"),
+                                "content": entry["content"],
+                            },
+                        )
+                        logger.debug(
+                            "Wrote user memory entry [%s]: %s",
+                            entry.get("category"), entry["content"][:60],
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to write user memory entry: %s", exc)
+
+            if planner_entries:
+                for entry in planner_entries:
+                    try:
+                        await http.post(
+                            f"{self._base}/api/v1/cortex/agents/task-planner-agent/entries",
+                            json={
+                                "category": entry.get("category", "Patterns"),
+                                "content": entry["content"],
+                            },
+                        )
+                        logger.debug(
+                            "Wrote planner memory entry [%s]: %s",
+                            entry.get("category"), entry["content"][:60],
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to write planner memory entry: %s", exc)
 
     async def discover_capabilities(self, force: bool = False) -> list[dict]:
         """
@@ -131,8 +313,51 @@ class TaskPlanner:
 
         return self._caps_cache  # return stale on network error
 
-    def _format_capabilities(self, agents: list[dict]) -> str:
-        lines: list[str] = []
+    async def check_needs_clarification(
+        self,
+        goal: str,
+        agents: list[dict],
+        memory_context: str = "",
+    ) -> dict:
+        """
+        Quick LLM call (max_tokens=512) to check if goal needs clarification.
+        Returns {"needs_clarification": bool, "questions": list[str], "understood_as": str}.
+        Fails open — returns {"needs_clarification": False} on any error.
+
+        memory_context: pre-fetched Cortex content; answers already present there
+        are treated as known and suppress the corresponding clarification questions.
+        """
+        caps_text = self._format_capabilities(agents, goal=goal, compact=True)
+        compact_memory = self._compact_memory_context(memory_context)
+        memory_section = (
+            f"\nPersonalisation memory (confirmed facts about this user — "
+            f"do NOT ask about anything already answered here):\n{compact_memory}\n"
+            if compact_memory else ""
+        )
+        try:
+            client = self._anthropic_client()
+            message = client.messages.create(
+                model=self._model,
+                max_tokens=512,
+                system=_CLARIFICATION_SYSTEM_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Goal: {goal}\n"
+                        f"{memory_section}\n"
+                        f"Available capabilities:\n{caps_text}"
+                    ),
+                }],
+            )
+            raw = message.content[0].text
+            logger.debug("Clarification check response: %s", raw[:300])
+            return self._extract_json(raw)
+        except Exception as exc:
+            logger.warning("Clarification check failed (fail open): %s", exc)
+            return {"needs_clarification": False}
+
+    def _flatten_capabilities(self, agents: list[dict]) -> list[dict]:
+        caps: list[dict] = []
         skip_agents = {"task-planner-agent", "task-executor-agent"}
         for agent in agents:
             agent_name = agent.get("name", "unknown")
@@ -144,32 +369,163 @@ class TaskPlanner:
                 if isinstance(cap, dict):
                     cap_name = cap.get("name", "")
                     cap_desc = cap.get("description", "")
-                    schema = cap.get("input_schema", {})
-                    required_fields = schema.get("required", [])
-                    properties = schema.get("properties", {})
+                    schema = cap.get("input_schema", {}) or {}
+                    required_fields = list(schema.get("required", []) or [])
+                    properties = dict(schema.get("properties", {}) or {})
+                    tags = list(cap.get("tags", []) or [])
+                    cost = cap.get("cost", {}) or {}
+                    cost_type = cost.get("type", "free")
+                    cost_usd = cost.get("estimated_cost_usd")
+                    cost_note = cost.get("notes", "")
                 else:
                     cap_name = str(cap)
                     cap_desc = ""
                     required_fields = []
                     properties = {}
+                    tags = []
+                    cost_type = "free"
+                    cost_usd = None
+                    cost_note = ""
 
                 if not cap_name:
                     continue
+                optional_fields = [f for f in properties.keys() if f not in required_fields]
+                caps.append({
+                    "agent_name": agent_name,
+                    "capability_name": cap_name,
+                    "description": cap_desc,
+                    "required_fields": required_fields,
+                    "optional_fields": optional_fields,
+                    "tags": tags,
+                    "cost_type": cost_type,
+                    "cost_usd": cost_usd,
+                    "cost_note": cost_note,
+                    "properties": properties,
+                })
+        return caps
 
-                lines.append(f"  - {cap_name} (agent: {agent_name})")
-                if cap_desc:
-                    lines.append(f"    Description: {cap_desc}")
-                if properties:
-                    lines.append("    Input fields:")
-                    for field_name, field_info in properties.items():
-                        marker = " [REQUIRED]" if field_name in required_fields else " [optional]"
-                        field_desc = field_info.get("description", "")
-                        field_type = field_info.get("type", "any")
-                        lines.append(f"      - {field_name} ({field_type}){marker}: {field_desc}")
+    @staticmethod
+    def _goal_tokens(goal: str) -> set[str]:
+        return {t for t in re.split(r"[^a-z0-9]+", (goal or "").lower()) if len(t) >= 3}
+
+    def _cap_score(self, cap: dict, goal_tokens: set[str]) -> int:
+        text = " ".join([
+            cap.get("capability_name", ""),
+            cap.get("agent_name", ""),
+            cap.get("description", ""),
+            " ".join(cap.get("tags", [])),
+            " ".join(cap.get("required_fields", [])),
+            " ".join(cap.get("optional_fields", [])),
+        ]).lower()
+        score = sum(1 for tok in goal_tokens if tok in text)
+        name = cap.get("capability_name", "")
+        if name in {"send_slack_message", "send_email", "send_whatsapp_message"}:
+            score += 1  # keep at least one low-cost completion channel near top
+        if name == "schedule_task" and {"schedule", "remind", "later", "tomorrow", "week"} & goal_tokens:
+            score += 3
+        return score
+
+    def _select_capabilities(self, agents: list[dict], goal: str, limit: int = _COMPACT_CAP_LIMIT) -> list[dict]:
+        all_caps = self._flatten_capabilities(agents)
+        if len(all_caps) <= limit:
+            return all_caps
+
+        goal_tokens = self._goal_tokens(goal)
+        ranked = sorted(
+            all_caps,
+            key=lambda c: (
+                self._cap_score(c, goal_tokens),
+                -len(c.get("required_fields", [])),
+            ),
+            reverse=True,
+        )
+        selected: list[dict] = []
+        used: set[tuple[str, str]] = set()
+
+        def _add(cap: dict) -> None:
+            key = (cap["agent_name"], cap["capability_name"])
+            if key in used:
+                return
+            selected.append(cap)
+            used.add(key)
+
+        # Ensure final-step messaging capability stays available.
+        for cap in ranked:
+            if cap["capability_name"] in {"send_slack_message", "send_email", "send_whatsapp_message"}:
+                _add(cap)
+                break
+
+        # If goal sounds time-based, keep scheduler capability visible.
+        if {"schedule", "remind", "later", "tomorrow", "week"} & goal_tokens:
+            for cap in ranked:
+                if cap["capability_name"] == "schedule_task":
+                    _add(cap)
+                    break
+
+        for cap in ranked:
+            if len(selected) >= limit:
+                break
+            _add(cap)
+        return selected[:limit]
+
+    def _format_capabilities(self, agents: list[dict], goal: str = "", compact: bool = False) -> str:
+        caps = self._select_capabilities(agents, goal) if compact else self._flatten_capabilities(agents)
+        lines: list[str] = []
+        for cap in caps:
+            cap_name = cap["capability_name"]
+            agent_name = cap["agent_name"]
+            cap_desc = cap.get("description", "")
+            required_fields = cap.get("required_fields", [])
+            optional_fields = cap.get("optional_fields", [])
+            properties = cap.get("properties", {})
+            cost_type = cap.get("cost_type", "free")
+            cost_usd = cap.get("cost_usd")
+            cost_note = cap.get("cost_note", "")
+
+            lines.append(f"  - {cap_name} (agent: {agent_name})")
+            if cap_desc:
+                short_desc = cap_desc if not compact else cap_desc[:140]
+                lines.append(f"    Description: {short_desc}")
+            if cost_type == "free" or cost_usd is None:
+                lines.append("    Cost: free")
+            else:
+                note = f" ({cost_note})" if cost_note else ""
+                lines.append(f"    Cost: ${cost_usd:.4f}/call{note}")
+            if properties:
+                lines.append("    Input fields:")
+                fields = list(required_fields)
+                if compact:
+                    fields.extend(optional_fields[:_MAX_OPTIONAL_FIELDS_PER_CAP])
+                else:
+                    fields.extend(optional_fields)
+                for field_name in fields:
+                    field_info = properties.get(field_name, {})
+                    marker = " [REQUIRED]" if field_name in required_fields else " [optional]"
+                    field_type = field_info.get("type", "any")
+                    field_desc = field_info.get("description", "")
+                    lines.append(f"      - {field_name} ({field_type}){marker}: {field_desc}")
 
         if not lines:
             return "  (no agents currently available)"
         return "\n".join(lines)
+
+    def _compact_memory_context(self, memory_context: str, max_chars: int = _MAX_MEMORY_CONTEXT_CHARS) -> str:
+        text = (memory_context or "").strip()
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        keep: list[str] = []
+        used = 0
+        for line in lines:
+            if used + len(line) + 1 > max_chars:
+                break
+            keep.append(line)
+            used += len(line) + 1
+        if not keep:
+            return text[: max_chars - 16] + "... (truncated)"
+        return "\n".join(keep) + "\n... (truncated)"
 
     def _extract_json(self, text: str) -> dict:
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -236,6 +592,10 @@ class TaskPlanner:
         requester_id: str,
         channel_id: str = "",
         thread_id: str = "",
+        user_id: str = "",
+        memory_context: str = "",
+        clarification_message: str = "",
+        clarification_answers: str = "",
     ) -> WorkflowPlan:
         """
         Generate a WorkflowPlan for *goal* using a single Anthropic API call.
@@ -243,14 +603,27 @@ class TaskPlanner:
 
         channel_id / thread_id identify where the completion response must be
         sent (the same channel and conversation thread as the original request).
+        user_id is used to fetch/write Cortex user memory for personalisation.
+        memory_context: pass a pre-fetched value to skip an extra Cortex fetch
+        (e.g. when the caller already fetched it for the clarification check).
+        clarification_message: the text that was sent to the user asking for
+        clarification. When provided together with clarification_answers, the
+        LLM call uses a multi-turn conversation history so it sees the full
+        back-and-forth context rather than a flattened string.
+        clarification_answers: the user's reply to the clarification questions.
         """
+        # ── Use pre-fetched memory context or fetch now ───────────────────────
+        if not memory_context:
+            memory_context = await self.fetch_memory_context(user_id=user_id)
+
         agents = await self.discover_capabilities()
-        caps_text = self._format_capabilities(agents)
+        caps_text = self._format_capabilities(agents, goal=goal, compact=True)
         now_utc = datetime.now(timezone.utc)
 
         logger.info(
-            "Planning workflow: goal=%r  agents=%d  (single LLM call)",
+            "Planning workflow: goal=%r  agents=%d  memory=%s  (single LLM call)",
             goal[:80], len(agents),
+            "yes" if memory_context else "none",
         )
 
         reply_context_lines: list[str] = [f"REQUESTER_ID: {requester_id}"]
@@ -258,32 +631,102 @@ class TaskPlanner:
             reply_context_lines.append(f"REPLY_CHANNEL_ID: {channel_id}")
         if thread_id:
             reply_context_lines.append(f"REPLY_THREAD_ID: {thread_id}")
+        if user_id:
+            reply_context_lines.append(f"USER_ID: {user_id}")
         reply_context = "\n".join(reply_context_lines)
+
+        compact_memory = self._compact_memory_context(memory_context)
+        memory_section = (
+            f"\nPersonalisation context from Cortex memory:\n{compact_memory}\n"
+            if compact_memory else ""
+        )
 
         user_msg = (
             f"CURRENT_UTC: {self._iso_utc(now_utc)}\n\n"
-            f"Request context:\n{reply_context}\n\n"
+            f"Request context:\n{reply_context}\n"
+            f"{memory_section}\n"
             f"Goal: {goal}\n\n"
             f"Available agent capabilities:\n{caps_text}\n\n"
             "Create a workflow plan to accomplish this goal. "
             "Include a clear goal for each step. "
             "Remember: the FINAL step must always send a completion response "
-            "back to the requester on the same channel and thread."
+            "back to the requester on the same channel and thread. "
+            "If the goal or memory context reveals stable user preferences or facts "
+            "worth remembering, include them in the optional memory_entries array."
         )
 
-        # ── Single LLM call ──────────────────────────────────────────────────
+        # ── Single or multi-turn LLM call ────────────────────────────────────
         client = self._anthropic_client()
+        if clarification_message and clarification_answers:
+            # Full multi-turn: planning context → prior questions → user answers.
+            # The LLM sees the exact back-and-forth so it can map each answer to
+            # the question that prompted it.
+            messages = [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": clarification_message},
+                {"role": "user", "content": clarification_answers},
+            ]
+            logger.info("Planning with multi-turn conversation history (3 turns)")
+        elif clarification_answers:
+            # Fallback: we have the user's answers but no stored question text.
+            # Inject the answers directly into the planning context so they are
+            # never silently dropped regardless of what happened to the stored msg.
+            user_msg += (
+                f"\n\nThe user provided these answers to clarification questions:\n"
+                f"{clarification_answers}"
+            )
+            messages = [{"role": "user", "content": user_msg}]
+            logger.info("Planning with clarification answers injected into context")
+        else:
+            messages = [{"role": "user", "content": user_msg}]
         message = client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
             system=_PLAN_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
+            messages=messages,
         )
         raw_text: str = message.content[0].text
         logger.debug("LLM response: %s", raw_text[:500])
 
         plan_dict = self._extract_json(raw_text)
         self._normalise_schedule_times(plan_dict, now_utc)
+
+        # ── Extract and persist memory entries (fire-and-forget) ─────────────
+        raw_memory_entries: list[dict] = plan_dict.pop("memory_entries", []) or []
+        user_entries = [
+            e for e in raw_memory_entries
+            if isinstance(e, dict) and e.get("content")
+        ][:3]
+
+        # Always record the goal as a planning pattern in planner's own namespace
+        goal_summary = goal[:120].replace("\n", " ")
+        planner_entries: list[dict] = [
+            {
+                "category": "Patterns",
+                "content": (
+                    f"Planned '{plan_dict.get('title', 'workflow')}' "
+                    f"({len(plan_dict.get('steps', []))} steps) for goal: {goal_summary}"
+                ),
+            }
+        ]
+
+        if user_entries or planner_entries:
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                self.write_memory_entries(
+                    user_entries=user_entries,
+                    user_id=user_id,
+                    planner_entries=planner_entries,
+                ),
+                name="cortex-write-plan",
+            )
+            if user_entries:
+                logger.info(
+                    "Queued %d Cortex memory entr%s for user %s",
+                    len(user_entries),
+                    "ies" if len(user_entries) != 1 else "y",
+                    user_id or "—",
+                )
 
         steps: list[WorkflowStep] = []
         for i, step_d in enumerate(plan_dict.get("steps", []), 1):

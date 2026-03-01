@@ -35,6 +35,7 @@ import httpx
 import websockets
 import websockets.exceptions
 
+from formatters import render_formatter
 from models import WorkflowPlan
 from planner import TaskPlanner
 from workflow_store import WorkflowStore
@@ -57,26 +58,50 @@ def _stable_agent_id() -> str:
 
 # ── Step-ref resolver ──────────────────────────────────────────────────────────
 
-_REF_RE = re.compile(r"\{\{steps\[(\d+)\]\.output\.([^}]+)\}\}")
+# Matches {{steps[N].output}} and {{steps[N].output.field.path}}
+# Group 1: step index; Group 2: optional dotted field path (None = whole output)
+_REF_RE = re.compile(r"\{\{steps\[(\d+)\]\.output(?:\.([^}]+))?\}\}")
+_ARRAY_KEY_RE = re.compile(r"^([^\[]+)\[(\d+)\]$")
+
+
+def _traverse(node: Any, key: str) -> Any:
+    """Traverse one path segment; supports array indexing like ``results[0]``."""
+    m = _ARRAY_KEY_RE.match(key)
+    if m:
+        dict_key, arr_idx = m.group(1), int(m.group(2))
+        node = node.get(dict_key) if isinstance(node, dict) else None
+        if isinstance(node, list) and arr_idx < len(node):
+            return node[arr_idx]
+        return None
+    return node.get(key) if isinstance(node, dict) else None
 
 
 def _resolve_step_refs(value: Any, outputs: list[Optional[dict]]) -> Any:
-    """Recursively substitute ``{{steps[N].output.field}}`` in *value*."""
+    """Recursively substitute ``{{steps[N].output[.field]}}`` in *value*.
+
+    When the field path is omitted (``{{steps[N].output}}``) the whole output
+    dict is returned — useful for passing an entire step's output as
+    ``input_data.data`` to a ``format_step_output`` step.
+    """
 
     def _resolve_str(s: str) -> Any:
         full = _REF_RE.fullmatch(s)
         if full:
-            idx, path = int(full.group(1)), full.group(2).split(".")
+            idx = int(full.group(1))
+            path_str = full.group(2)   # None when no .field path given
             node: Any = (outputs[idx] or {}) if idx < len(outputs) else {}
-            for key in path:
-                node = node.get(key) if isinstance(node, dict) else None
-            return node
+            if path_str:
+                for key in path_str.split("."):
+                    node = _traverse(node, key)
+            return node  # may be a dict/list when path_str is None
 
         def _sub(m: re.Match) -> str:
-            idx, path = int(m.group(1)), m.group(2).split(".")
+            idx = int(m.group(1))
+            path_str = m.group(2)
             node: Any = (outputs[idx] or {}) if idx < len(outputs) else {}
-            for key in path:
-                node = node.get(key) if isinstance(node, dict) else None
+            if path_str:
+                for key in path_str.split("."):
+                    node = _traverse(node, key)
             return str(node) if node is not None else m.group(0)
 
         return _REF_RE.sub(_sub, s)
@@ -196,6 +221,7 @@ REGISTRATION_PAYLOAD: dict = {
                 },
             },
             "tags": ["planning", "llm", "workflow"],
+            "cost": {"type": "per_call", "estimated_cost_usd": 0.003, "notes": "Claude API ~1k tokens/plan"},
         },
         {
             "name": "get_workflow_status",
@@ -215,6 +241,7 @@ REGISTRATION_PAYLOAD: dict = {
                 "properties": {"workflow": {"type": "object"}},
             },
             "tags": ["planning", "workflow"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
         },
         {
             "name": "list_workflows",
@@ -233,6 +260,55 @@ REGISTRATION_PAYLOAD: dict = {
                 },
             },
             "tags": ["planning", "workflow"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "SQLite read"},
+        },
+        {
+            "name": "format_step_output",
+            "description": (
+                "Format a prior workflow step's raw output into a human-readable "
+                "Slack message using a registered Jinja2 template for that capability. "
+                "Use {{steps[N].output}} in input_data.data to pass the full output of "
+                "step N. The formatted text is returned as output_data.text."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "description": (
+                            "The raw output dict from a prior step. "
+                            "Use the template reference {{steps[N].output}} so the "
+                            "executor substitutes the actual output at dispatch time."
+                        ),
+                    },
+                    "capability_name": {
+                        "type": "string",
+                        "description": (
+                            "Exact capability name whose formatter template to use "
+                            "(e.g. 'serper_search', 'browse_web'). Falls back to a "
+                            "generic formatter when no specific template is registered."
+                        ),
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": (
+                            "Optional: custom Jinja2 template string. Overrides the "
+                            "registered formatter when provided."
+                        ),
+                    },
+                },
+                "required": ["data", "capability_name"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Formatted, Slack-ready message text.",
+                    },
+                },
+            },
+            "tags": ["formatting", "slack", "template"],
+            "cost": {"type": "free", "estimated_cost_usd": None, "notes": "Local Jinja2 render"},
         },
     ],
     "tags": ["planner", "llm", "workflow", "orchestration"],
@@ -469,6 +545,14 @@ class OrchestratorClient:
                 if not fut.done():
                     fut.set_result(payload)
 
+        elif mtype == "memory_response":
+            # Cortex write/query response — acknowledged, nothing to act on
+            corr = msg.get("correlation_id")
+            logger.debug(
+                "memory_response received (corr=%s success=%s)",
+                corr, payload.get("success"),
+            )
+
         elif mtype == "settings_push":
             logger.info("Settings pushed: %d key(s)", len(payload))
             self._common_settings.update(payload)
@@ -516,6 +600,8 @@ class OrchestratorClient:
                 output, error = await self._cap_get_workflow_status(input_data)
             elif capability == "list_workflows":
                 output, error = await self._cap_list_workflows(input_data)
+            elif capability == "format_step_output":
+                output, error = await self._cap_format_step_output(input_data)
             else:
                 output, error = None, f"Unknown capability: {capability!r}"
 
@@ -586,12 +672,114 @@ class OrchestratorClient:
         if not self._planner:
             return None, "Planner not initialised"
 
+        # ── Fetch Cortex memory once — used for clarification check AND planning ──
+        memory_context = await self._planner.fetch_memory_context(user_id=user_id)
+        if memory_context:
+            logger.info("Cortex memory loaded for user=%s", user_id or "—")
+
+        # ── Clarification gate ────────────────────────────────────────────────
+        effective_goal = goal
+        clarification_message = ""
+        clarification_answers = ""
+
+        # Step 1: check if incoming message is a reply to a pending clarification
+        if thread_id and channel_id:
+            pending = await asyncio.to_thread(
+                self._store.get_pending_clarification, thread_id, channel_id
+            )
+            if pending:
+                logger.info("Clarification reply received (thread=%s)", thread_id[:12])
+                # Restore the original goal; keep the user's reply as answers
+                # so plan() can build a proper multi-turn conversation history.
+                effective_goal = pending['goal']
+                clarification_answers = goal  # the user's answers to the questions
+
+                clarification_message = pending.get('clarification_message', '')
+                if not clarification_message:
+                    # Reconstruct from the stored questions list — covers records
+                    # created before the clarification_message column was added.
+                    try:
+                        stored_qs = json.loads(pending.get('questions', '[]'))
+                        if stored_qs:
+                            q_lines = "\n".join(
+                                f"{i+1}. {q}" for i, q in enumerate(stored_qs)
+                            )
+                            clarification_message = (
+                                f"Before creating a plan, I asked:\n{q_lines}"
+                            )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if clarification_message:
+                    logger.debug(
+                        "Clarification context restored (len=%d)", len(clarification_message)
+                    )
+                else:
+                    logger.warning(
+                        "No clarification_message available — answers will be "
+                        "injected directly into planning context"
+                    )
+
+                await asyncio.to_thread(
+                    self._store.delete_pending_clarification, pending["id"]
+                )
+
+        # Step 2: if not a reply (effective_goal unchanged) and we can send messages,
+        #         check if clarification is needed — memory context suppresses
+        #         questions whose answers are already known from Cortex.
+        if effective_goal == goal and (channel_id or user_id) and self._planner:
+            try:
+                agents = await self._planner.discover_capabilities()
+                clarity = await self._planner.check_needs_clarification(
+                    goal, agents, memory_context=memory_context
+                )
+                if clarity.get("needs_clarification") and clarity.get("questions"):
+                    questions: list[str] = clarity["questions"][:3]
+                    understood_as: str = clarity.get("understood_as", "")
+
+                    q_lines = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+                    if understood_as:
+                        msg = (
+                            f"I understand you'd like: _{understood_as}_\n\n"
+                            f"Before I create a plan, I have a few questions:\n{q_lines}\n\n"
+                            "_Please reply in this thread with your answers._"
+                        )
+                    else:
+                        msg = (
+                            f"Before I create a plan, I need a few details:\n{q_lines}\n\n"
+                            "_Please reply in this thread with your answers._"
+                        )
+
+                    clarification_id = str(uuid.uuid4())
+                    await asyncio.to_thread(
+                        self._store.save_pending_clarification,
+                        clarification_id, thread_id, channel_id,
+                        requester_id, user_id, goal, json.dumps(questions), msg,
+                    )
+                    await self._send_clarification_message(
+                        channel_id, msg, thread_ts=thread_id, user_id=user_id
+                    )
+                    logger.info(
+                        "Sent %d clarification question(s) (id=%s)",
+                        len(questions), clarification_id[:8],
+                    )
+                    return {
+                        "task_id": clarification_id,
+                        "status":  "awaiting_clarification",
+                        "message": "Clarification questions sent to requester",
+                    }, None
+            except Exception as exc:
+                logger.warning("Clarification check failed — proceeding directly: %s", exc)
+
         # ── Single LLM call ──────────────────────────────────────────────────
         try:
             plan: WorkflowPlan = await self._planner.plan(
-                goal, requester_id,
+                effective_goal, requester_id,
                 channel_id=channel_id,
                 thread_id=thread_id,
+                user_id=user_id,
+                memory_context=memory_context,        # reuse already-fetched context
+                clarification_message=clarification_message,  # "" for fresh requests
+                clarification_answers=clarification_answers,  # "" for fresh requests
             )
         except Exception as exc:
             logger.error("Planning failed: %s", exc)
@@ -605,7 +793,7 @@ class OrchestratorClient:
         # ── Persist ──────────────────────────────────────────────────────────
         await asyncio.to_thread(
             self._store.create_workflow,
-            plan.task_id, goal, plan.title, plan.description,
+            plan.task_id, effective_goal, plan.title, plan.description,
             requester_id, steps,
         )
         await asyncio.to_thread(self._store.set_status, plan.task_id, "running")
@@ -616,7 +804,7 @@ class OrchestratorClient:
             "task_id":         plan.task_id,
             "title":           plan.title,
             "description":     plan.description,
-            "goal":            goal,
+            "goal":            effective_goal,
             "total_steps":     len(steps),
             "workflow_status": "running",
         })
@@ -804,6 +992,18 @@ class OrchestratorClient:
                     "workflow_status": "completed",
                 })
 
+                # Record completed workflow in planner's Cortex memory (best-effort)
+                wf_title = workflow.get("title", task_id[:8])
+                wf_goal  = (workflow.get("goal") or "")[:100].replace("\n", " ")
+                asyncio.create_task(
+                    self._write_cortex_entry(
+                        "task-planner-agent",
+                        "Patterns",
+                        f"Completed '{wf_title}' ({total} steps) — goal: {wf_goal}",
+                    ),
+                    name=f"cortex-complete-{task_id[:8]}",
+                )
+
         else:
             # Step failed — persist and abort
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
@@ -846,6 +1046,10 @@ class OrchestratorClient:
         re-dispatch their current step. Clears stale correlations first to
         avoid acting on responses from the previous connection.
         """
+        deleted = await asyncio.to_thread(self._store.cleanup_stale_clarifications)
+        if deleted:
+            logger.info("Cleaned up %d stale pending clarification(s)", deleted)
+
         running = await asyncio.to_thread(self._store.list_running)
         if not running:
             return
@@ -892,6 +1096,21 @@ class OrchestratorClient:
         wfs = await asyncio.to_thread(self._store.list_workflows, limit)
         return {"workflows": wfs, "count": len(wfs)}, None
 
+    # ── Capability: format_step_output ────────────────────────────────────────
+
+    async def _cap_format_step_output(
+        self, input_data: dict
+    ) -> tuple[dict | None, str | None]:
+        data = input_data.get("data")
+        if data is None:
+            return None, "input_data.data is required"
+        capability_name = _clean_text(input_data.get("capability_name", ""))
+        template_override = _clean_text(input_data.get("template", ""))
+        text = await asyncio.to_thread(
+            render_formatter, capability_name, data, template_override
+        )
+        return {"text": text}, None
+
     # ── Discovery (cached) ─────────────────────────────────────────────────────
 
     async def _discover_best(self, capability: str) -> Optional[str]:
@@ -928,6 +1147,74 @@ class OrchestratorClient:
         except Exception as exc:
             logger.error("Discovery request failed: %s", exc)
         return None
+
+    # ── Clarification message ──────────────────────────────────────────────────
+
+    async def _send_clarification_message(
+        self,
+        channel_id: str,
+        text: str,
+        thread_ts: str = "",
+        user_id: str = "",
+    ) -> Optional[str]:
+        """
+        Send a Slack message directly (outside any workflow step).
+        Uses the existing _pending_responses mechanism to await the reply ts.
+        Returns Slack message ts, or None on failure.
+        """
+        agent_id = await self._discover_best("send_slack_message")
+        if not agent_id:
+            logger.warning("No send_slack_message agent available for clarification")
+            return None
+
+        req_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_responses[req_id] = fut
+
+        input_data: dict = {"channel": channel_id, "text": text}
+        if thread_ts:
+            input_data["thread_ts"] = thread_ts
+        if user_id and not channel_id:
+            input_data["user_id"] = user_id
+
+        ws_ref = self._current_ws
+        if ws_ref is None:
+            self._pending_responses.pop(req_id, None)
+            return None
+
+        await self._ws_send(ws_ref, _envelope(
+            sender_id=self._agent_id,
+            msg_type="task_request",
+            payload={"capability": "send_slack_message", "input_data": input_data},
+            recipient_id=agent_id,
+            msg_id=req_id,
+        ))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=30.0)
+            return (result.get("output_data") or {}).get("ts")
+        except (asyncio.TimeoutError, Exception) as exc:
+            self._pending_responses.pop(req_id, None)
+            logger.warning("Clarification message timed out / failed: %s", exc)
+            return None
+
+    # ── Cortex memory helpers ──────────────────────────────────────────────────
+
+    async def _write_cortex_entry(
+        self, agent_namespace: str, category: str, content: str
+    ) -> None:
+        """Write a single entry to a Cortex memory namespace via REST (best-effort)."""
+        try:
+            resp = await self._http.post(
+                f"{self._base}/api/v1/cortex/agents/{agent_namespace}/entries",
+                json={"category": category, "content": content},
+            )
+            if resp.status_code not in (200, 201, 204):
+                logger.debug(
+                    "Cortex write returned %d for %s", resp.status_code, agent_namespace
+                )
+        except Exception as exc:
+            logger.debug("Cortex write failed (%s): %s", agent_namespace, exc)
 
     # ── workflow_event emission ────────────────────────────────────────────────
 

@@ -67,8 +67,30 @@ class WorkflowStore:
             );
             CREATE INDEX IF NOT EXISTS idx_sc_task
                 ON step_correlations (task_id);
+            CREATE TABLE IF NOT EXISTS pending_clarifications (
+                id                   TEXT PRIMARY KEY,
+                thread_id            TEXT NOT NULL,
+                channel_id           TEXT NOT NULL,
+                requester_id         TEXT NOT NULL,
+                user_id              TEXT NOT NULL DEFAULT '',
+                goal                 TEXT NOT NULL,
+                questions            TEXT NOT NULL,
+                clarification_message TEXT NOT NULL DEFAULT '',
+                created_at           TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pc_thread
+                ON pending_clarifications (thread_id, channel_id);
         """)
         self._conn.commit()
+        # Migrate existing tables created before clarification_message was added
+        try:
+            self._conn.execute(
+                "ALTER TABLE pending_clarifications "
+                "ADD COLUMN clarification_message TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # ── Write ────────────────────────────────────────────────────────────────
 
@@ -165,6 +187,56 @@ class WorkflowStore:
             (task_id, step_index),
         )
         self._conn.commit()
+
+    # ── Pending clarifications ────────────────────────────────────────────────
+
+    def save_pending_clarification(
+        self,
+        id: str,
+        thread_id: str,
+        channel_id: str,
+        requester_id: str,
+        user_id: str,
+        goal: str,
+        questions_json: str,
+        clarification_message: str = "",
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO pending_clarifications
+               (id, thread_id, channel_id, requester_id, user_id, goal, questions,
+                clarification_message, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (id, thread_id, channel_id, requester_id, user_id, goal, questions_json,
+             clarification_message, _now_iso()),
+        )
+        self._conn.commit()
+
+    def get_pending_clarification(self, thread_id: str, channel_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            """SELECT * FROM pending_clarifications
+               WHERE thread_id=? AND channel_id=?
+               ORDER BY created_at DESC LIMIT 1""",
+            (thread_id, channel_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_pending_clarification(self, id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM pending_clarifications WHERE id=?", (id,)
+        )
+        self._conn.commit()
+
+    def cleanup_stale_clarifications(self, older_than_hours: int = 24) -> int:
+        """Delete clarifications older than *older_than_hours*; return count deleted."""
+        threshold_s = older_than_hours * 3600
+        cur = self._conn.execute(
+            """DELETE FROM pending_clarifications
+               WHERE CAST(strftime('%s','now') AS INTEGER)
+                   - CAST(strftime('%s', created_at) AS INTEGER) > ?""",
+            (threshold_s,),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     # ── Read ─────────────────────────────────────────────────────────────────
 
