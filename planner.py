@@ -12,9 +12,8 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional
 
-import anthropic
 import httpx
 
 from models import WorkflowPlan, WorkflowStep
@@ -28,139 +27,62 @@ _MAX_OPTIONAL_FIELDS_PER_CAP: int = 2
 _MAX_MEMORY_CONTEXT_CHARS: int = 1200
 
 _PLAN_SYSTEM_PROMPT = """\
-You are a workflow planning AI. Given a task description and a list of \
-available agent capabilities, you create detailed step-by-step workflow plans.
-
-Your output must be valid JSON in exactly this format (no extra text):
+You are a workflow planning AI. Output valid JSON only — no extra text:
 {
-  "title": "Short title for the workflow (max 60 chars)",
-  "description": "One-sentence description of what the workflow accomplishes",
+  "title": "Short title (max 60 chars)",
+  "description": "One-sentence description",
   "steps": [
     {
       "name": "Step name (max 40 chars)",
-      "goal": "Why this step is needed — what it achieves toward the overall goal",
-      "description": "Detailed description of what this step does and how",
-      "capability": "exact_capability_name_from_available_list",
+      "goal": "Why this step is needed",
+      "description": "What this step does",
+      "capability": "exact_capability_name",
       "input_data": { "key": "value" }
     }
   ],
   "memory_entries": [
-    { "category": "Facts|Preferences|Patterns|Instructions", "content": "One concise fact about the user worth remembering" }
+    { "category": "Facts|Preferences|Patterns|Instructions", "content": "concise fact" }
   ]
 }
 
 Rules:
-- Interpreting conversation context (read this first): When the request arrives as a
-  multi-turn conversation (prior assistant questions followed by a user reply), ALWAYS
-  read the assistant's previous message to understand what was asked before interpreting
-  the user's reply. Explicitly map each part of the user's answer to the question that
-  prompted it. For example: if the prior message asked "What car do you drive?" and the
-  user replied "Tesla", the resolved meaning is "the user drives a Tesla" — use THAT
-  meaning when planning, not the raw word "Tesla". Apply this same principle to all
-  answers: short, single-word, or list replies only make sense relative to the question
-  that preceded them. Never treat a contextual reply as an ambiguous standalone goal.
-- Only use capabilities that appear in the provided list.
-- Each step must have concrete, non-placeholder input_data values.
-- Each step must have a clear goal explaining its purpose in the overall plan.
-- Steps are executed sequentially; later steps may reference earlier outputs using
-  the template syntax: {{steps[N].output.field_path}} (0-indexed).
-- Keep step count minimal — combine operations when logical.
-- CURRENT_UTC will be provided in the user message. Resolve any relative time
-  expressions (today/tomorrow/next week) against CURRENT_UTC.
-- For any step with capability=schedule_task, input_data.scheduled_at must be
-  an ISO 8601 UTC timestamp and must be in the future vs CURRENT_UTC.
-- If no suitable capabilities are available for part of the goal, note it \
-  in the description and skip that step.
-- Cost awareness: Each capability includes an estimated cost per call. When multiple \
-  capabilities can accomplish the same sub-goal with equivalent quality, prefer the \
-  lower-cost option. Never sacrifice output quality or completeness for cost savings — \
-  always use the best-fit capability for the task. Free capabilities carry no cost \
-  penalty. High-cost capabilities (e.g. browse_web ~$0.0150) should only be used when \
-  no cheaper alternative (e.g. serper_search ~$0.0010) can adequately fulfil the step.
-- Formatting step outputs for Slack: NEVER hardcode field references like
-  {{steps[N].output.results[0].title}} in send_slack_message text. Instead,
-  insert a format_step_output step immediately before the send_slack_message
-  step:
-    • input_data.data: {{steps[N].output}}  (whole output of the data step; N is its 0-based index)
-    • input_data.capability_name: exact capability name of step N (e.g. "serper_search")
-  The send_slack_message step that follows uses {{steps[K].output.text}} as
-  its text, where K is the 0-based index of the format_step_output step.
-  Only use format_step_output when the results will be shown to a user in
-  Slack.  Skip it for intermediate data steps whose output feeds another step.
-- MANDATORY FINAL STEP: The very last step of every plan MUST send a completion
-  response back to the requester. Use an available messaging or notification
-  capability (e.g. send_message, reply_message, slack_reply, send_reply, or
-  similar) to notify the requester that the workflow finished and summarise what
-  was accomplished. The message must be delivered to the same channel and
-  conversation thread as the original request — use the REPLY_CHANNEL_ID and
-  REPLY_THREAD_ID values from the request context when provided (pass them as
-  channel_id and thread_id in input_data). If no messaging capability is
-  available, use capability="send_response" and document the intended message in
-  input_data.message.
-- Memory entries (optional, max 3): The "memory_entries" key may contain facts
-  about the USER worth storing for future personalization. Only include stable,
-  reusable information — preferences, standing facts, recurring patterns, or
-  explicit instructions. Do NOT store transient task details. Each entry needs
-  "category" (Facts/Preferences/Patterns/Instructions) and "content" (one
-  concise phrase, no leading dash). Omit "memory_entries" entirely if nothing
-  is worth storing. If prior memory context is provided, use it to avoid storing
-  duplicates and to inform plan personalization.
-- Memory query goals: If the goal asks what you know about the user (e.g. "Do
-  you know what car I drive?") and the memory context does NOT contain the
-  answer, create a single-step plan that sends a message to the user explaining
-  you don't have that information yet and inviting them to share it (e.g. "I
-  don't have your car saved yet — just reply with your car make/model and I'll
-  remember it for next time."). If the memory DOES contain the answer, create
-  a single-step plan that reports it back to the user.
-- Storing user-provided personal info: If the conversation context (especially
-  from a prior clarification exchange) reveals the user has provided a personal
-  fact (e.g. they answered "Tesla" to "What car do you drive?"), treat this as
-  a memory-store request. Create a plan with ONE step: send a confirmation
-  message (e.g. "Got it! I've noted that you drive a Tesla."). Include the fact
-  in memory_entries so it is persisted. Do NOT perform unrelated tasks or
-  research with the provided info — just store it and confirm.
+- Conversation context: In multi-turn requests, read the prior assistant message first
+  to interpret the user's reply. Map each answer to the question that prompted it
+  (e.g. "Tesla" after "What car do you drive?" = user drives a Tesla). Never treat a
+  contextual reply as a standalone goal.
+- Only use capabilities from the provided list; use concrete input_data (no placeholders).
+- Steps run sequentially. Reference earlier outputs with {{steps[N].output.field}} (0-indexed).
+- Keep step count minimal.
+- Resolve relative dates against CURRENT_UTC. schedule_task.scheduled_at must be ISO 8601 UTC in the future.
+- Prefer lower-cost capabilities when quality is equivalent.
+- Slack output: never hardcode field refs in send_slack_message. Insert format_step_output
+  before it (input_data.data={{steps[N].output}}, input_data.capability_name=<step N cap>);
+  the send step uses {{steps[K].output.text}}. Only use it for user-facing messages.
+- Final step: always send a completion message via a messaging capability using
+  REPLY_CHANNEL_ID and REPLY_THREAD_ID from the request context.
+- memory_entries (optional, max 3): stable user facts — preferences, standing facts,
+  recurring patterns, explicit instructions. Omit transient details and duplicates.
+- Memory queries ("Do you know my X?"): if memory has the answer report it; if not,
+  ask the user to share it in one step.
+- User-provided info (e.g. "Tesla" answering "What car?"): one step — confirm and store
+  in memory_entries. Do not research or act on the info further.
 """
 
 
 _CLARIFICATION_SYSTEM_PROMPT = """\
-You are a workflow planning assistant. Assess whether the goal is clear enough \
-to create a detailed, accurate workflow plan without further input.
+Assess whether the goal needs clarification before planning. Output JSON only:
 
-Output JSON in exactly one of these formats (no extra text):
-
-If the goal is clear:
-{"needs_clarification": false}
-
-If important details are missing or ambiguous:
-{
-  "needs_clarification": true,
-  "questions": ["Question 1?", "Question 2?"],
-  "understood_as": "One-line restatement of what was understood"
-}
+Clear: {"needs_clarification": false}
+Unclear: {"needs_clarification": true, "questions": ["Q1?", "Q2?"], "understood_as": "restatement"}
 
 Rules:
-- Interpreting prior-question replies (read this first): If the context includes
-  conversation history — prior assistant questions followed by a user reply — read the
-  assistant's questions BEFORE assessing the user's reply. Resolve each answer against
-  the question that prompted it. A short reply (e.g. "Tesla", "yes", "next Friday") is
-  NOT ambiguous when a prior question makes its meaning clear (e.g. "What car do you
-  drive?"). In such cases, treat the meaning as resolved and output
-  needs_clarification: false. Do NOT ask again for information the user has already
-  provided in this exchange.
-- Maximum 3 questions. Ask ONLY when truly needed — missing targets, ambiguous \
-  scope, conflicting constraints. Do NOT ask about things that can be inferred.
-- For self-contained, unambiguous goals output needs_clarification: false.
-- If available capabilities make the goal clearly achievable, output false.
-- If personalisation memory context is provided, treat it as confirmed facts about
-  this user. Do NOT ask questions whose answers are already present in the memory.
-  If the memory supplies the missing detail, proceed with needs_clarification: false.
-  Only ask when information is genuinely absent from both the goal AND the memory.
-- IMPORTANT: If the goal is a question about what information you have about the
-  user (e.g. "Do you know what car I drive?", "Do you know my name?", "What do you
-  know about me?"), do NOT ask the user to provide that information. Output
-  needs_clarification: false. The planner will check memory and respond
-  appropriately — either confirming what it knows or asking the user to share it
-  as part of the workflow response.
+- Prior-question replies: read prior questions before judging. A short answer is resolved
+  by the question that prompted it — output false. Do not re-ask for info already given.
+- Max 3 questions. Ask only for genuinely missing info (targets, scope, constraints).
+  Do not ask about things that can be inferred or that capabilities make unnecessary.
+- Memory context = confirmed facts. Do not ask about anything already in memory.
+- If the goal asks what you know about the user (e.g. "Do you know my car?"),
+  output false — the planner resolves it via memory lookup.
 """
 
 
@@ -170,12 +92,13 @@ class TaskPlanner:
     def __init__(
         self,
         orchestrator_base_url: str,
-        api_key: Optional[str] = None,
+        agent_id: str = "",
         model: str = "claude-sonnet-4-6",
         max_tokens: int = 2048,
     ) -> None:
         self._base = orchestrator_base_url.rstrip("/")
-        self._api_key = api_key
+        self._agent_id = agent_id
+        self._proxy_url = f"{self._base}/api/v1/llm/complete"
         self._model = model
         self._max_tokens = max_tokens
 
@@ -183,11 +106,22 @@ class TaskPlanner:
         self._caps_cache_time: float = 0.0
         self._caps_cache: list[dict] = []
 
-    def _anthropic_client(self) -> anthropic.Anthropic:
-        kwargs: dict[str, Any] = {}
-        if self._api_key:
-            kwargs["api_key"] = self._api_key
-        return anthropic.Anthropic(**kwargs)
+    async def _proxy_complete(self, messages: list[dict], system: str, max_tokens: int) -> str:
+        """Send a completion request to the orchestrator LLM proxy and return the response text."""
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(
+                self._proxy_url,
+                headers={"X-Agent-Id": self._agent_id},
+                json={
+                    "model": self._model,
+                    "messages": messages,
+                    "system": system,
+                    "max_tokens": max_tokens,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            return next(b["text"] for b in data["content"] if b["type"] == "text")
 
     async def fetch_memory_context(self, user_id: str = "") -> str:
         """
@@ -335,11 +269,7 @@ class TaskPlanner:
             if compact_memory else ""
         )
         try:
-            client = self._anthropic_client()
-            message = client.messages.create(
-                model=self._model,
-                max_tokens=512,
-                system=_CLARIFICATION_SYSTEM_PROMPT,
+            raw = await self._proxy_complete(
                 messages=[{
                     "role": "user",
                     "content": (
@@ -348,8 +278,9 @@ class TaskPlanner:
                         f"Available capabilities:\n{caps_text}"
                     ),
                 }],
+                system=_CLARIFICATION_SYSTEM_PROMPT,
+                max_tokens=512,
             )
-            raw = message.content[0].text
             logger.debug("Clarification check response: %s", raw[:300])
             return self._extract_json(raw)
         except Exception as exc:
@@ -656,7 +587,6 @@ class TaskPlanner:
         )
 
         # ── Single or multi-turn LLM call ────────────────────────────────────
-        client = self._anthropic_client()
         if clarification_message and clarification_answers:
             # Full multi-turn: planning context → prior questions → user answers.
             # The LLM sees the exact back-and-forth so it can map each answer to
@@ -679,13 +609,11 @@ class TaskPlanner:
             logger.info("Planning with clarification answers injected into context")
         else:
             messages = [{"role": "user", "content": user_msg}]
-        message = client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=_PLAN_SYSTEM_PROMPT,
+        raw_text: str = await self._proxy_complete(
             messages=messages,
+            system=_PLAN_SYSTEM_PROMPT,
+            max_tokens=self._max_tokens,
         )
-        raw_text: str = message.content[0].text
         logger.debug("LLM response: %s", raw_text[:500])
 
         plan_dict = self._extract_json(raw_text)

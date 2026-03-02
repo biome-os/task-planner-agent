@@ -16,7 +16,7 @@ LLM optimisations
 ─────────────────
 - Capability list cached 60 s — multiple plans share one REST fetch
 - Discovery (best agent per capability) cached 30 s per capability key
-- Exactly ONE anthropic.messages.create call per plan_task request
+- Exactly ONE LLM proxy call per plan_task request
 """
 from __future__ import annotations
 
@@ -318,15 +318,7 @@ REGISTRATION_PAYLOAD: dict = {
         "llm_calls_per_plan": 1,
         "persistence": "sqlite",
     },
-    "required_settings": [
-        {
-            "key": "anthropic_api_key",
-            "label": "Anthropic API Key",
-            "type": "secret",
-            "required": False,
-            "description": "API key for Claude. Falls back to ANTHROPIC_API_KEY env var.",
-        }
-    ],
+    "required_settings": [],
 }
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -409,7 +401,7 @@ class OrchestratorClient:
         await self._register()
         self._planner = TaskPlanner(
             orchestrator_base_url=self._base,
-            api_key=self._common_settings.get("anthropic_api_key"),
+            agent_id=self._agent_id,
         )
         await self._connect_loop()
 
@@ -426,9 +418,6 @@ class OrchestratorClient:
         self._ws_url        = data["ws_url"]
         self._common_settings = data.get("common_settings", {})
         logger.info("Registered — agent_id=%s", self._agent_id)
-        api_key = self._common_settings.get("anthropic_api_key")
-        if api_key and self._planner:
-            self._planner._api_key = api_key
 
     # ── WebSocket loop ─────────────────────────────────────────────────────────
 
@@ -556,9 +545,6 @@ class OrchestratorClient:
         elif mtype == "settings_push":
             logger.info("Settings pushed: %d key(s)", len(payload))
             self._common_settings.update(payload)
-            api_key = payload.get("anthropic_api_key")
-            if api_key and self._planner:
-                self._planner._api_key = api_key
 
         elif mtype == "error":
             logger.error("Orchestrator error [%s]: %s",
