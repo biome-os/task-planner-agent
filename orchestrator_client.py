@@ -207,6 +207,18 @@ REGISTRATION_PAYLOAD: dict = {
                         "type": "string",
                         "description": "Conversation thread identifier to reply into when the workflow completes.",
                     },
+                    "delivery_channel": {
+                        "type": "string",
+                        "description": "Preferred delivery channel for summaries/completion (e.g. slack, email, telegram, whatsapp).",
+                    },
+                    "persona": {
+                        "type": "string",
+                        "description": "Optional persona/tone for generated summaries (e.g. executive, friendly, concise).",
+                    },
+                    "summary_format": {
+                        "type": "string",
+                        "description": "Optional format instructions for summaries (e.g. bullets with action items).",
+                    },
                 },
                 "required": ["goal"],
             },
@@ -641,6 +653,9 @@ class OrchestratorClient:
         channel_id = _clean_text(input_data.get("channel_id"))
         user_id    = _clean_text(input_data.get("user_id"))
         thread_id  = _clean_text(input_data.get("thread_id"))
+        delivery_channel = _clean_text(input_data.get("delivery_channel")).lower()
+        persona = _clean_text(input_data.get("persona"))
+        summary_format = _clean_text(input_data.get("summary_format"))
         payload = input_data.get("payload")
         if isinstance(payload, dict):
             if not channel_id:
@@ -653,6 +668,12 @@ class OrchestratorClient:
                     _clean_text(payload.get("thread_id"))
                     or _clean_text(payload.get("thread_ts"))
                 )
+            if not delivery_channel:
+                delivery_channel = _clean_text(payload.get("delivery_channel")).lower()
+            if not persona:
+                persona = _clean_text(payload.get("persona"))
+            if not summary_format:
+                summary_format = _clean_text(payload.get("summary_format"))
         if not goal:
             return None, "input_data.goal is required"
         if not self._planner:
@@ -763,6 +784,9 @@ class OrchestratorClient:
                 channel_id=channel_id,
                 thread_id=thread_id,
                 user_id=user_id,
+                delivery_channel=delivery_channel,
+                persona=persona,
+                summary_format=summary_format,
                 memory_context=memory_context,        # reuse already-fetched context
                 clarification_message=clarification_message,  # "" for fresh requests
                 clarification_answers=clarification_answers,  # "" for fresh requests

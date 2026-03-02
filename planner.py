@@ -60,6 +60,13 @@ Rules:
   the send step uses {{steps[K].output.text}}. Only use it for user-facing messages.
 - Final step: always send a completion message via a messaging capability using
   REPLY_CHANNEL_ID and REPLY_THREAD_ID from the request context.
+- If request preferences include DELIVERY_CHANNEL, prefer that channel's messaging
+  capability for the final completion step when available:
+  slack -> send_slack_message, email -> send_email, telegram -> send_telegram_message,
+  whatsapp -> send_whatsapp_message. If unavailable, use any available messaging capability.
+- If you include summarize_content steps, pass through request preferences into
+  input_data when provided: persona -> input_data.persona, DELIVERY_CHANNEL ->
+  input_data.delivery_channel, SUMMARY_FORMAT -> input_data.output_format.
 - memory_entries (optional, max 3): stable user facts — preferences, standing facts,
   recurring patterns, explicit instructions. Omit transient details and duplicates.
 - Memory queries ("Do you know my X?"): if memory has the answer report it; if not,
@@ -350,7 +357,7 @@ class TaskPlanner:
         ]).lower()
         score = sum(1 for tok in goal_tokens if tok in text)
         name = cap.get("capability_name", "")
-        if name in {"send_slack_message", "send_email", "send_whatsapp_message"}:
+        if name in {"send_slack_message", "send_email", "send_whatsapp_message", "send_telegram_message"}:
             score += 1  # keep at least one low-cost completion channel near top
         if name == "schedule_task" and {"schedule", "remind", "later", "tomorrow", "week"} & goal_tokens:
             score += 3
@@ -382,7 +389,7 @@ class TaskPlanner:
 
         # Ensure final-step messaging capability stays available.
         for cap in ranked:
-            if cap["capability_name"] in {"send_slack_message", "send_email", "send_whatsapp_message"}:
+            if cap["capability_name"] in {"send_slack_message", "send_email", "send_whatsapp_message", "send_telegram_message"}:
                 _add(cap)
                 break
 
@@ -524,6 +531,9 @@ class TaskPlanner:
         channel_id: str = "",
         thread_id: str = "",
         user_id: str = "",
+        delivery_channel: str = "",
+        persona: str = "",
+        summary_format: str = "",
         memory_context: str = "",
         clarification_message: str = "",
         clarification_answers: str = "",
@@ -564,6 +574,12 @@ class TaskPlanner:
             reply_context_lines.append(f"REPLY_THREAD_ID: {thread_id}")
         if user_id:
             reply_context_lines.append(f"USER_ID: {user_id}")
+        if delivery_channel:
+            reply_context_lines.append(f"DELIVERY_CHANNEL: {delivery_channel}")
+        if persona:
+            reply_context_lines.append(f"PERSONA: {persona}")
+        if summary_format:
+            reply_context_lines.append(f"SUMMARY_FORMAT: {summary_format}")
         reply_context = "\n".join(reply_context_lines)
 
         compact_memory = self._compact_memory_context(memory_context)
