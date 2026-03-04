@@ -75,7 +75,9 @@ class WorkflowPlan:
     goal: str
     steps: list[WorkflowStep]
     requester_id: str
+    memory_entries: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
+    planning_mode: str = "full-context"  # e.g. "vector-single(top8)", "vector-multiphase(complex,3ph)"
 
     @classmethod
     def create(
@@ -103,6 +105,8 @@ class WorkflowPlan:
             "goal": self.goal,
             "steps": [s.to_dict() for s in self.steps],
             "requester_id": self.requester_id,
+            "memory_entries": self.memory_entries,
             "created_at": self.created_at,
             "total_steps": len(self.steps),
+            "planning_mode": self.planning_mode,
         }

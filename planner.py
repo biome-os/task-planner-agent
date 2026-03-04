@@ -25,6 +25,11 @@ _CAPS_CACHE_TTL_S: float = 60.0   # re-fetch agents at most once per minute
 _COMPACT_CAP_LIMIT: int = 10
 _MAX_OPTIONAL_FIELDS_PER_CAP: int = 2
 _MAX_MEMORY_CONTEXT_CHARS: int = 1200
+_SENSITIVE_KEYWORDS = (
+    "password", "passcode", "otp", "token", "api key", "secret", "ssn",
+    "social security", "credit card", "card number", "cvv", "bank account",
+    "routing number", "dob", "date of birth", "medical", "diagnosis",
+)
 
 _PLAN_SYSTEM_PROMPT = """\
 You are a workflow planning AI. Output valid JSON only — no extra text:
@@ -93,6 +98,43 @@ Rules:
 """
 
 
+_FOLLOWUP_MEMORY_SYSTEM_PROMPT = """\
+You answer whether a follow-up question can be resolved from provided memory context only.
+Return strict JSON only:
+{"found": true|false, "answer": "string", "confidence": 0.0-1.0}
+
+Rules:
+- Use ONLY the provided memory context; do not infer beyond it.
+- If context is insufficient, return {"found": false, "answer": "", "confidence": 0.0}.
+- Keep answer concise and directly usable as a tool input value.
+"""
+
+
+_DECOMPOSE_SYSTEM_PROMPT = """\
+Analyze a goal and identify the capability domains and execution phases needed.
+Output strict JSON only:
+{
+  "complexity": "simple" | "moderate" | "complex",
+  "phases": [
+    {
+      "name": "Short phase name",
+      "description": "What this phase accomplishes",
+      "search_queries": ["query1", "query2"]
+    }
+  ]
+}
+
+Rules:
+- simple: 1-2 steps, single capability domain (e.g. just send email). 1 phase.
+- moderate: 3-5 steps, 2-3 domains (e.g. search + summarise + notify). 2-3 phases.
+- complex: 6+ steps or 3+ distinct capability domains. 3-4 phases.
+- search_queries: 2-3 natural-language phrases that describe what kind of agent
+  capability is needed for that phase (used for semantic capability retrieval).
+  Be specific: "read emails from gmail", "search the web for news", "send slack message".
+- Keep phases to the minimum needed; merge closely related steps.
+"""
+
+
 class TaskPlanner:
     """Discovers capabilities (cached) and uses one LLM call to produce a plan."""
 
@@ -112,6 +154,29 @@ class TaskPlanner:
         # Capability cache: (fetch_time, agents_list)
         self._caps_cache_time: float = 0.0
         self._caps_cache: list[dict] = []
+
+        # Vector search settings — updated live via update_settings()
+        self._vector_search_enabled: bool = False
+        self._vector_search_top_k: int = 8
+        self._vector_search_multiphase: bool = False
+
+    def update_settings(self, settings: dict) -> None:
+        """Apply common_settings pushed from the orchestrator."""
+        raw_enabled = str(settings.get("vector_search_enabled", "false")).lower().strip()
+        self._vector_search_enabled = raw_enabled in ("true", "1", "yes")
+
+        raw_multiphase = str(settings.get("vector_search_multiphase", "false")).lower().strip()
+        self._vector_search_multiphase = raw_multiphase in ("true", "1", "yes")
+
+        try:
+            self._vector_search_top_k = max(3, int(settings.get("vector_search_top_k", 8)))
+        except (ValueError, TypeError):
+            self._vector_search_top_k = 8
+
+        logger.info(
+            "Planner settings updated: vector_search=%s top_k=%d multiphase=%s",
+            self._vector_search_enabled, self._vector_search_top_k, self._vector_search_multiphase,
+        )
 
     async def _proxy_complete(self, messages: list[dict], system: str, max_tokens: int) -> str:
         """Send a completion request to the orchestrator LLM proxy and return the response text."""
@@ -254,6 +319,142 @@ class TaskPlanner:
 
         return self._caps_cache  # return stale on network error
 
+    # ── Vector search ──────────────────────────────────────────────────────
+
+    async def discover_capabilities_semantic(
+        self, goal: str, limit: Optional[int] = None
+    ) -> list[dict]:
+        """
+        Call the orchestrator's TF-IDF vector index to retrieve the top-K
+        capabilities most relevant to *goal*.  Falls back to an empty list on
+        any error so the caller can degrade gracefully to the full-context path.
+        """
+        k = limit or self._vector_search_top_k
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                resp = await http.post(
+                    f"{self._base}/api/v1/discover/semantic",
+                    json={"goal": goal, "limit": k},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    logger.info(
+                        "Vector search returned %d/%d capabilities (top_k=%d)",
+                        data.get("count", 0), data.get("total_indexed", 0), k,
+                    )
+                    return data.get("capabilities", [])
+                logger.warning("Semantic search HTTP %d — falling back", resp.status_code)
+        except Exception as exc:
+            logger.warning("Semantic search failed (%s) — falling back", exc)
+        return []
+
+    def _format_semantic_caps(self, results: list[dict], goal: str = "") -> str:
+        """Format vector-search results into the same capability text the LLM expects."""
+        skip_agents = {"task-planner-agent", "task-executor-agent"}
+        lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for item in results:
+            agent_name = item.get("agent_name", "unknown")
+            if agent_name in skip_agents:
+                continue
+            cap_dict = item.get("capability") or {}
+            cap_name = cap_dict.get("name") or item.get("capability_name", "")
+            key = (agent_name, cap_name)
+            if key in seen or not cap_name:
+                continue
+            seen.add(key)
+
+            cap_desc = cap_dict.get("description", "")
+            schema = cap_dict.get("input_schema") or {}
+            props = schema.get("properties") or {}
+            required = list(schema.get("required") or [])
+            tags = cap_dict.get("tags") or []
+            cost = cap_dict.get("cost") or {}
+            cost_type = cost.get("type", "free")
+            cost_usd = cost.get("estimated_cost_usd")
+            score = item.get("score", 0.0)
+
+            lines.append(f"  - {cap_name} (agent: {agent_name}, relevance: {score:.2f})")
+            if cap_desc:
+                lines.append(f"    Description: {cap_desc[:160]}")
+            if cost_type == "free" or cost_usd is None:
+                lines.append("    Cost: free")
+            else:
+                lines.append(f"    Cost: ${cost_usd:.4f}/call")
+            if props:
+                lines.append("    Input fields:")
+                for field_name, field_info in props.items():
+                    marker = " [REQUIRED]" if field_name in required else " [optional]"
+                    field_type = field_info.get("type", "any") if isinstance(field_info, dict) else "any"
+                    field_desc = field_info.get("description", "") if isinstance(field_info, dict) else ""
+                    lines.append(f"      - {field_name} ({field_type}){marker}: {field_desc}")
+        return "\n".join(lines) if lines else "  (no relevant capabilities found)"
+
+    # ── Multi-phase goal decomposition ─────────────────────────────────────
+
+    async def decompose_goal(self, goal: str, memory_context: str = "") -> dict:
+        """
+        Lightweight LLM call that classifies the goal complexity and returns
+        per-phase search queries for targeted capability retrieval.
+
+        Returns {"complexity": str, "phases": [{"name", "description", "search_queries"}]}.
+        Falls back to a single-phase structure on any error.
+        """
+        compact_memory = self._compact_memory_context(memory_context)
+        memory_section = (
+            f"\nMemory context:\n{compact_memory}\n" if compact_memory else ""
+        )
+        try:
+            raw = await self._proxy_complete(
+                messages=[{
+                    "role": "user",
+                    "content": f"Goal: {goal}\n{memory_section}",
+                }],
+                system=_DECOMPOSE_SYSTEM_PROMPT,
+                max_tokens=512,
+            )
+            result = self._extract_json(raw)
+            phases = result.get("phases") or []
+            if not phases:
+                raise ValueError("Empty phases")
+            logger.info(
+                "Goal decomposed: complexity=%s phases=%d",
+                result.get("complexity", "?"), len(phases),
+            )
+            return result
+        except Exception as exc:
+            logger.warning("Goal decomposition failed (%s) — using single-phase fallback", exc)
+            return {
+                "complexity": "simple",
+                "phases": [{"name": "Execute", "description": goal, "search_queries": [goal]}],
+            }
+
+    async def _gather_multiphase_caps(self, goal: str, phases: list[dict]) -> str:
+        """
+        For each phase, run vector searches and union the results (deduplicated).
+        Returns formatted capability text ready for the planning LLM prompt.
+        """
+        seen_keys: set[tuple[str, str]] = set()
+        combined: list[dict] = []
+        per_phase_k = max(4, self._vector_search_top_k // max(len(phases), 1))
+
+        for phase in phases:
+            queries = phase.get("search_queries") or [phase.get("description", goal)]
+            for q in queries:
+                search_query = f"{goal} {q}".strip()
+                results = await self.discover_capabilities_semantic(search_query, limit=per_phase_k)
+                for item in results:
+                    key = (item.get("agent_name", ""), item.get("capability_name", ""))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        combined.append(item)
+
+        logger.info(
+            "Multi-phase search: %d unique capabilities gathered across %d phase(s)",
+            len(combined), len(phases),
+        )
+        return self._format_semantic_caps(combined, goal=goal)
+
     async def check_needs_clarification(
         self,
         goal: str,
@@ -293,6 +494,44 @@ class TaskPlanner:
         except Exception as exc:
             logger.warning("Clarification check failed (fail open): %s", exc)
             return {"needs_clarification": False}
+
+    async def answer_followup_from_memory(
+        self,
+        question: str,
+        memory_context: str = "",
+    ) -> dict:
+        """
+        Try to answer a follow-up question from memory context only.
+        Returns {"found": bool, "answer": str, "confidence": float}.
+        """
+        compact_memory = self._compact_memory_context(memory_context)
+        if not compact_memory.strip():
+            return {"found": False, "answer": "", "confidence": 0.0}
+        try:
+            raw = await self._proxy_complete(
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Memory context:\n{compact_memory}"
+                    ),
+                }],
+                system=_FOLLOWUP_MEMORY_SYSTEM_PROMPT,
+                max_tokens=256,
+            )
+            parsed = self._extract_json(raw)
+            found = bool(parsed.get("found"))
+            answer = str(parsed.get("answer", "")).strip()
+            try:
+                confidence = float(parsed.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            if not found or not answer:
+                return {"found": False, "answer": "", "confidence": max(0.0, confidence)}
+            return {"found": True, "answer": answer, "confidence": max(0.0, min(1.0, confidence))}
+        except Exception as exc:
+            logger.warning("Follow-up memory answer failed (fail closed): %s", exc)
+            return {"found": False, "answer": "", "confidence": 0.0}
 
     def _flatten_capabilities(self, agents: list[dict]) -> list[dict]:
         caps: list[dict] = []
@@ -475,6 +714,22 @@ class TaskPlanner:
         raise ValueError(f"No JSON found in LLM response: {text[:300]!r}")
 
     @staticmethod
+    def is_sensitive_memory_entry(entry: dict) -> bool:
+        content = str((entry or {}).get("content", "")).lower()
+        if not content:
+            return False
+        if any(k in content for k in _SENSITIVE_KEYWORDS):
+            return True
+        # Simple PII patterns
+        if re.search(r"\b\d{3}-\d{2}-\d{4}\b", content):   # US SSN
+            return True
+        if re.search(r"\b(?:\d[ -]*?){13,19}\b", content): # card-like long digit sequence
+            return True
+        if re.search(r"\b\d{10,}\b", content):             # long numeric identifiers
+            return True
+        return False
+
+    @staticmethod
     def _parse_iso_datetime(raw: str) -> datetime | None:
         s = (raw or "").strip()
         if not s:
@@ -557,14 +812,38 @@ class TaskPlanner:
         if not memory_context:
             memory_context = await self.fetch_memory_context(user_id=user_id)
 
-        agents = await self.discover_capabilities()
-        caps_text = self._format_capabilities(agents, goal=goal, compact=True)
         now_utc = datetime.now(timezone.utc)
 
+        # ── Capability retrieval: vector search or full-context ───────────────
+        planning_mode: str
+        if self._vector_search_enabled:
+            if self._vector_search_multiphase:
+                # Multi-phase: decompose goal → targeted per-phase searches
+                decomposition = await self.decompose_goal(goal, memory_context=memory_context)
+                phases = decomposition.get("phases", [])
+                complexity = decomposition.get("complexity", "simple")
+                caps_text = await self._gather_multiphase_caps(goal, phases)
+                planning_mode = f"vector-multiphase({complexity},{len(phases)}ph)"
+            else:
+                # Single vector search
+                vec_results = await self.discover_capabilities_semantic(goal)
+                if vec_results:
+                    caps_text = self._format_semantic_caps(vec_results, goal=goal)
+                    planning_mode = f"vector-single(top{self._vector_search_top_k})"
+                else:
+                    # Vector search returned nothing — fall back to full context
+                    logger.warning("Vector search returned no results — falling back to full context")
+                    agents = await self.discover_capabilities()
+                    caps_text = self._format_capabilities(agents, goal=goal, compact=True)
+                    planning_mode = "full-context(vector-fallback)"
+        else:
+            agents = await self.discover_capabilities()
+            caps_text = self._format_capabilities(agents, goal=goal, compact=True)
+            planning_mode = "full-context"
+
         logger.info(
-            "Planning workflow: goal=%r  agents=%d  memory=%s  (single LLM call)",
-            goal[:80], len(agents),
-            "yes" if memory_context else "none",
+            "Planning workflow: goal=%r  mode=%s  memory=%s",
+            goal[:80], planning_mode, "yes" if memory_context else "none",
         )
 
         reply_context_lines: list[str] = [f"REQUESTER_ID: {requester_id}"]
@@ -654,23 +933,22 @@ class TaskPlanner:
             }
         ]
 
-        if user_entries or planner_entries:
+        if planner_entries:
             import asyncio as _asyncio
             _asyncio.create_task(
                 self.write_memory_entries(
-                    user_entries=user_entries,
+                    user_entries=[],
                     user_id=user_id,
                     planner_entries=planner_entries,
                 ),
                 name="cortex-write-plan",
             )
-            if user_entries:
-                logger.info(
-                    "Queued %d Cortex memory entr%s for user %s",
-                    len(user_entries),
-                    "ies" if len(user_entries) != 1 else "y",
-                    user_id or "—",
-                )
+        if user_entries:
+            logger.info(
+                "Extracted %d candidate user memory entr%s for consented storage",
+                len(user_entries),
+                "ies" if len(user_entries) != 1 else "y",
+            )
 
         steps: list[WorkflowStep] = []
         for i, step_d in enumerate(plan_dict.get("steps", []), 1):
@@ -692,9 +970,11 @@ class TaskPlanner:
             steps=steps,
             requester_id=requester_id,
         )
+        plan.memory_entries = user_entries
+        plan.planning_mode = planning_mode  # stored for dashboard/logging inspection
         logger.info(
-            "Plan created: task_id=%s  title=%r  steps=%d\n%s",
-            plan.task_id, plan.title, len(steps),
+            "Plan created: task_id=%s  title=%r  steps=%d  mode=%s\n%s",
+            plan.task_id, plan.title, len(steps), planning_mode,
             json.dumps(plan.to_dict(), indent=2),
         )
         return plan

@@ -11,6 +11,9 @@ Execution model
 6. Planner looks up (task_id, step_index) via correlation_id in DB
 7. Step output saved; next step dispatched (repeat until all done)
 8. workflow_event messages emitted throughout for dashboard tracing
+9. If a step returns output_data.followup_request, planner resolves from Cortex
+   or asks user, patches step input, then retries the same step.
+10. Sensitive memory entries require explicit user consent before Cortex write.
 
 LLM optimisations
 ─────────────────
@@ -162,6 +165,74 @@ def _inject_slack_user_id(steps: list[dict[str, Any]], user_id: str) -> None:
             nested_data = input_data.get("input_data")
             if nested_cap == "send_slack_message" and isinstance(nested_data, dict):
                 nested_data.setdefault("user_id", user_id)
+
+
+def _parse_yes_no_reply(text: str) -> Optional[bool]:
+    """Parse a free-text user reply into yes/no/unknown."""
+    t = _clean_text(text).lower()
+    if not t:
+        return None
+    yes = {"y", "yes", "ok", "okay", "continue", "proceed", "approve", "approved", "go"}
+    no = {"n", "no", "stop", "cancel", "deny", "decline", "reject", "do not continue", "dont continue"}
+    if t in yes:
+        return True
+    if t in no:
+        return False
+    if any(k in t for k in (" yes", "continue", "proceed", "approve")):
+        return True
+    if any(k in t for k in (" no", "stop", "cancel", "decline", "reject")):
+        return False
+    return None
+
+
+def _normalise_followup_answer(
+    answer_text: str,
+    answer_format: str,
+    choices: list[str],
+) -> tuple[Optional[object], Optional[str]]:
+    """Parse a user answer according to follow-up answer_format."""
+    raw = _clean_text(answer_text)
+    fmt = _clean_text(answer_format).lower() or "text"
+    if fmt == "boolean":
+        val = _parse_yes_no_reply(raw)
+        if val is None:
+            return None, "Please reply with yes or no."
+        return val, None
+    if fmt == "choice":
+        if not choices:
+            return raw, None
+        lowered = {c.lower(): c for c in choices}
+        if raw.lower() in lowered:
+            return lowered[raw.lower()], None
+        for c in choices:
+            if c.lower() in raw.lower():
+                return c, None
+        opts = ", ".join(choices)
+        return None, f"Please choose one of: {opts}"
+    if fmt == "number":
+        try:
+            if "." in raw:
+                return float(raw), None
+            return int(raw), None
+        except Exception:
+            return None, "Please reply with a valid number."
+    if fmt == "json":
+        try:
+            return json.loads(raw), None
+        except Exception:
+            return None, "Please reply with valid JSON."
+    return raw, None
+
+
+def _memory_entries_preview(entries: list[dict], limit: int = 3) -> str:
+    lines: list[str] = []
+    for idx, entry in enumerate(entries[:limit], 1):
+        category = _clean_text(entry.get("category", "Facts")) or "Facts"
+        content = _clean_text(entry.get("content", ""))
+        if len(content) > 140:
+            content = content[:137] + "..."
+        lines.append(f"{idx}. [{category}] {content}")
+    return "\n".join(lines)
 
 
 # ── Agent identity ─────────────────────────────────────────────────────────────
@@ -340,6 +411,7 @@ MAX_BACKOFF_S:          int   = 60
 DRAIN_TIMEOUT_S:        int   = 30
 STEP_TIMEOUT_S:         float = 300.0   # 5 min per step
 DISCOVERY_CACHE_TTL_S:  float = 30.0   # cache best-agent per capability
+MAX_REPLAN_ATTEMPTS:    int   = 3
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -415,6 +487,7 @@ class OrchestratorClient:
             orchestrator_base_url=self._base,
             agent_id=self._agent_id,
         )
+        self._planner.update_settings(self._common_settings)
         await self._connect_loop()
 
     # ── Registration ───────────────────────────────────────────────────────────
@@ -557,6 +630,8 @@ class OrchestratorClient:
         elif mtype == "settings_push":
             logger.info("Settings pushed: %d key(s)", len(payload))
             self._common_settings.update(payload)
+            if self._planner is not None:
+                self._planner.update_settings(self._common_settings)
 
         elif mtype == "error":
             logger.error("Orchestrator error [%s]: %s",
@@ -679,6 +754,50 @@ class OrchestratorClient:
         if not self._planner:
             return None, "Planner not initialised"
 
+        # Step -1: check if this is a reply to a pending agent follow-up question
+        if thread_id and channel_id:
+            pending_followup = await asyncio.to_thread(
+                self._store.get_pending_followup, thread_id, channel_id
+            )
+            if pending_followup:
+                return await self._handle_followup_reply(
+                    ws=ws,
+                    user_reply=goal,
+                    pending=pending_followup,
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+
+        # Step 0: check if this is a reply to a pending replan approval request
+        if thread_id and channel_id:
+            pending_replan = await asyncio.to_thread(
+                self._store.get_pending_replan_approval, thread_id, channel_id
+            )
+            if pending_replan:
+                return await self._handle_replan_approval_reply(
+                    ws=ws,
+                    user_reply=goal,
+                    pending=pending_replan,
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+
+        # Step 0.5: reply to pending sensitive-memory consent request
+        if thread_id and channel_id:
+            pending_consent = await asyncio.to_thread(
+                self._store.get_pending_memory_consent, thread_id, channel_id
+            )
+            if pending_consent:
+                return await self._handle_memory_consent_reply(
+                    user_reply=goal,
+                    pending=pending_consent,
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+
         # ── Fetch Cortex memory once — used for clarification check AND planning ──
         memory_context = await self._planner.fetch_memory_context(user_id=user_id)
         if memory_context:
@@ -800,11 +919,72 @@ class OrchestratorClient:
         logger.info("Plan ready: task_id=%s  title=%r  steps=%d",
                     plan.task_id, plan.title, len(steps))
 
+        # ── Persist user memory entries with sensitive-data consent ───────────
+        memory_entries = [
+            e for e in (plan.memory_entries or [])
+            if isinstance(e, dict) and _clean_text(e.get("content"))
+        ]
+        sensitive_entries = [
+            e for e in memory_entries if self._planner.is_sensitive_memory_entry(e)
+        ]
+        non_sensitive_entries = [
+            e for e in memory_entries if not self._planner.is_sensitive_memory_entry(e)
+        ]
+        if non_sensitive_entries:
+            asyncio.create_task(
+                self._planner.write_memory_entries(
+                    user_entries=non_sensitive_entries,
+                    user_id=user_id,
+                    planner_entries=None,
+                ),
+                name=f"cortex-user-memory-{plan.task_id[:8]}",
+            )
+            if channel_id:
+                await self._send_clarification_message(
+                    channel_id=channel_id,
+                    thread_ts=thread_id,
+                    user_id=user_id,
+                    text=(
+                        f"Saved {len(non_sensitive_entries)} preference/fact entr"
+                        f"{'ies' if len(non_sensitive_entries) != 1 else 'y'} to memory."
+                    ),
+                )
+        if sensitive_entries and channel_id and thread_id:
+            preview = _memory_entries_preview(sensitive_entries)
+            consent_prompt = (
+                "I detected sensitive information that could be stored in memory.\n"
+                f"{preview}\n\n"
+                "Reply `yes` to store it in Cortex for future tasks, or `no` to keep it out of memory."
+            )
+            consent_id = str(uuid.uuid4())
+            await asyncio.to_thread(
+                self._store.save_pending_memory_consent,
+                consent_id,
+                thread_id,
+                channel_id,
+                requester_id,
+                user_id,
+                json.dumps(sensitive_entries),
+                consent_prompt,
+            )
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=consent_prompt,
+            )
+
         # ── Persist ──────────────────────────────────────────────────────────
         await asyncio.to_thread(
             self._store.create_workflow,
             plan.task_id, effective_goal, plan.title, plan.description,
             requester_id, steps,
+            channel_id=channel_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            delivery_channel=delivery_channel,
+            persona=persona,
+            summary_format=summary_format,
         )
         await asyncio.to_thread(self._store.set_status, plan.task_id, "running")
 
@@ -871,27 +1051,15 @@ class OrchestratorClient:
             err = f"No available agent for capability '{capability}'"
             logger.warning("Workflow %s step %d: %s", task_id[:8], step_index + 1, err)
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
-            await asyncio.to_thread(self._store.set_status, task_id, "failed", err)
-            await self._emit_workflow_event(ws, {
-                "event":          "step_failed",
-                "task_id":        task_id,
-                "step_id":        step_id,
-                "step_order":     step_index + 1,
-                "step_name":      step_name,
-                "capability":     capability,
-                "error":          err,
-                "total_steps":    total,
-                "workflow_status": "failed",
-            })
-            await self._emit_workflow_event(ws, {
-                "event":           "workflow_failed",
-                "task_id":         task_id,
-                "steps_completed": step_index,
-                "steps_failed":    1,
-                "total_steps":     total,
-                "error":           err,
-                "workflow_status": "failed",
-            })
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg=err,
+                duration_ms=0,
+            )
             return
 
         # Emit step_started
@@ -964,6 +1132,17 @@ class OrchestratorClient:
         duration_ms = payload.get("duration_ms", 0)
 
         if success:
+            if isinstance(output, dict) and output.get("followup_request"):
+                await self._handle_agent_followup_request(
+                    ws=ws,
+                    task_id=task_id,
+                    workflow=workflow,
+                    step_index=step_index,
+                    step=step,
+                    followup_request=output.get("followup_request"),
+                )
+                return
+
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, output)
             completed = step_index + 1
 
@@ -1018,35 +1197,563 @@ class OrchestratorClient:
             # Step failed — persist and abort
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
             err_msg = error or "Unknown error"
-            await asyncio.to_thread(
-                self._store.set_status, task_id, "failed",
-                f"Step {step_index + 1} '{step_name}' failed: {err_msg}",
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg=err_msg,
+                duration_ms=duration_ms,
             )
-            logger.warning("Workflow %s: step %d/%d failed: %s",
-                           task_id[:8], step_index + 1, total, err_msg)
 
+    async def _handle_workflow_failure(
+        self,
+        ws,
+        task_id: str,
+        workflow: dict,
+        step_index: int,
+        step: dict,
+        err_msg: str,
+        duration_ms: float,
+    ) -> None:
+        """Emit failure events, notify user, and prepare a re-plan approval request."""
+        steps = workflow.get("steps", [])
+        total = len(steps)
+        step_name = step.get("name", f"Step {step_index + 1}")
+        capability = step.get("capability", "")
+        completed = step_index
+        fail_detail = f"Step {step_index + 1} '{step_name}' failed: {err_msg}"
+
+        await asyncio.to_thread(self._store.set_status, task_id, "failed", fail_detail)
+        logger.warning(
+            "Workflow %s: step %d/%d failed: %s",
+            task_id[:8], step_index + 1, total, err_msg,
+        )
+
+        await self._emit_workflow_event(ws, {
+            "event":           "step_failed",
+            "task_id":         task_id,
+            "step_id":         step.get("step_id"),
+            "step_order":      step_index + 1,
+            "step_name":       step_name,
+            "capability":      capability,
+            "error":           err_msg,
+            "duration_ms":     duration_ms,
+            "steps_failed":    1,
+            "total_steps":     total,
+            "workflow_status": "failed",
+        })
+        await self._emit_workflow_event(ws, {
+            "event":           "workflow_failed",
+            "task_id":         task_id,
+            "steps_completed": completed,
+            "steps_failed":    1,
+            "total_steps":     total,
+            "error":           err_msg,
+            "workflow_status": "failed",
+        })
+
+        channel_id = _clean_text(workflow.get("channel_id"))
+        thread_id = _clean_text(workflow.get("thread_id"))
+        user_id = _clean_text(workflow.get("user_id"))
+        goal = _clean_text(workflow.get("goal"))
+        if not channel_id:
+            # Without a channel we cannot request permission interactively.
+            return
+
+        summary = (
+            f"Workflow failed.\n"
+            f"- Task: {workflow.get('title') or task_id}\n"
+            f"- Failed step: {step_index + 1}/{total} — {step_name} ({capability})\n"
+            f"- Error: {err_msg}"
+        )
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text=summary,
+        )
+
+        replan_count = int(workflow.get("replan_count") or 0)
+        if replan_count >= MAX_REPLAN_ATTEMPTS or not self._planner:
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=(
+                    f"Automatic re-plan limit reached ({replan_count}/{MAX_REPLAN_ATTEMPTS}) "
+                    "or planner unavailable. Please provide new instructions."
+                ),
+            )
+            return
+
+        failure_context_goal = (
+            f"{goal}\n\n"
+            f"Previous attempt failed.\n"
+            f"Failure step: {step_index + 1}/{total} ({step_name}, capability={capability}).\n"
+            f"Error: {err_msg}\n"
+            "Create an alternative plan that avoids the failed path and still achieves the goal."
+        )
+        try:
+            replan = await self._planner.plan(
+                goal=failure_context_goal,
+                requester_id=_clean_text(workflow.get("requester_id")),
+                channel_id=channel_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                delivery_channel=_clean_text(workflow.get("delivery_channel")),
+                persona=_clean_text(workflow.get("persona")),
+                summary_format=_clean_text(workflow.get("summary_format")),
+            )
+        except Exception as exc:
+            logger.warning("Workflow %s re-plan generation failed: %s", task_id[:8], exc)
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=f"Could not generate a revised plan automatically: {exc}",
+            )
+            return
+
+        replanned_steps = [s.to_dict() for s in replan.steps]
+        _inject_slack_user_id(replanned_steps, user_id)
+        next_replan_count = replan_count + 1
+        prompt = (
+            f"{summary}\n\n"
+            f"I created a revised plan (attempt {next_replan_count}/{MAX_REPLAN_ATTEMPTS}) "
+            f"with {len(replanned_steps)} step(s).\n"
+            "Reply `yes` to continue with the revised plan, or `no` to stop."
+        )
+        approval_id = str(uuid.uuid4())
+        await asyncio.to_thread(
+            self._store.save_pending_replan_approval,
+            approval_id,
+            task_id,
+            thread_id,
+            channel_id,
+            _clean_text(workflow.get("requester_id")),
+            user_id,
+            next_replan_count,
+            prompt,
+            failure_context_goal,
+            replan.title,
+            replan.description,
+            json.dumps(replanned_steps),
+        )
+        await asyncio.to_thread(
+            self._store.set_status,
+            task_id,
+            "awaiting_replan_approval",
+            f"Awaiting user approval for re-plan attempt {next_replan_count}",
+        )
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text=prompt,
+        )
+
+    async def _handle_replan_approval_reply(
+        self,
+        ws,
+        user_reply: str,
+        pending: dict,
+        channel_id: str,
+        thread_id: str,
+        user_id: str,
+    ) -> tuple[dict | None, str | None]:
+        decision = _parse_yes_no_reply(user_reply)
+        task_id = pending.get("task_id", "")
+        approval_id = pending.get("id", "")
+        if decision is None:
+            msg = (
+                "Please reply with `yes` to continue with the revised plan "
+                "or `no` to keep the workflow stopped."
+            )
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=msg,
+            )
+            return {
+                "task_id": task_id,
+                "status": "awaiting_replan_approval",
+                "message": "Waiting for explicit yes/no confirmation",
+            }, None
+
+        await asyncio.to_thread(self._store.delete_pending_replan_approval, approval_id)
+
+        if decision is False:
+            await asyncio.to_thread(
+                self._store.set_status,
+                task_id,
+                "failed",
+                "User declined re-plan continuation",
+            )
             await self._emit_workflow_event(ws, {
-                "event":          "step_failed",
-                "task_id":        task_id,
-                "step_id":        step_id,
-                "step_order":     step_index + 1,
-                "step_name":      step_name,
-                "capability":     capability,
-                "error":          err_msg,
-                "duration_ms":    duration_ms,
-                "steps_failed":   1,
-                "total_steps":    total,
+                "event": "workflow_failed",
+                "task_id": task_id,
+                "error": "User declined re-plan continuation",
                 "workflow_status": "failed",
             })
-            await self._emit_workflow_event(ws, {
-                "event":           "workflow_failed",
-                "task_id":         task_id,
-                "steps_completed": step_index,
-                "steps_failed":    1,
-                "total_steps":     total,
-                "error":           err_msg,
-                "workflow_status": "failed",
-            })
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text="Understood. Workflow remains stopped. Share new instructions whenever you want to retry.",
+            )
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "message": "User declined re-plan continuation",
+            }, None
+
+        try:
+            steps = json.loads(pending.get("replanned_steps_json", "[]"))
+            if not isinstance(steps, list) or not steps:
+                raise ValueError("Stored re-plan is empty or invalid")
+        except Exception as exc:
+            return None, f"Failed to restore stored re-plan: {exc}"
+
+        await asyncio.to_thread(
+            self._store.replace_workflow_plan,
+            task_id,
+            pending.get("replanned_goal", ""),
+            pending.get("replanned_title", ""),
+            pending.get("replanned_description", ""),
+            steps,
+            int(pending.get("replan_count") or 0),
+        )
+        await self._emit_workflow_event(ws, {
+            "event": "workflow_started",
+            "task_id": task_id,
+            "title": pending.get("replanned_title", ""),
+            "description": pending.get("replanned_description", ""),
+            "goal": pending.get("replanned_goal", ""),
+            "total_steps": len(steps),
+            "workflow_status": "running",
+        })
+        asyncio.create_task(
+            self._dispatch_step(ws, task_id, 0),
+            name=f"replan-step-{task_id[:8]}-0",
+        )
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text="Approved. Continuing with the revised plan now.",
+        )
+        return {
+            "task_id": task_id,
+            "status": "running",
+            "message": "Re-plan approved and resumed",
+        }, None
+
+    @staticmethod
+    def _apply_followup_answer_to_input(
+        base_input: dict[str, Any],
+        field_name: str,
+        question_id: str,
+        answer: object,
+    ) -> dict[str, Any]:
+        updated = dict(base_input)
+        if field_name:
+            updated[field_name] = answer
+        answers = dict(updated.get("followup_answers", {}) or {})
+        answers[question_id] = answer
+        updated["followup_answers"] = answers
+        return updated
+
+    async def _handle_agent_followup_request(
+        self,
+        ws,
+        task_id: str,
+        workflow: dict,
+        step_index: int,
+        step: dict,
+        followup_request: object,
+    ) -> None:
+        """Route agent follow-up either from Cortex context or to the user."""
+        if isinstance(followup_request, str):
+            req = {"question": followup_request}
+        elif isinstance(followup_request, dict):
+            req = dict(followup_request)
+        else:
+            req = {}
+        question = _clean_text(req.get("question"))
+        if not question:
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg="Agent requested follow-up but did not provide a question",
+                duration_ms=0,
+            )
+            return
+        question_id = _clean_text(req.get("question_id")) or str(uuid.uuid4())
+        field_name = _clean_text(req.get("field"))
+        answer_format = _clean_text(req.get("answer_format")).lower() or "text"
+        choices = req.get("choices") if isinstance(req.get("choices"), list) else []
+        choices = [str(c) for c in choices if str(c).strip()]
+
+        channel_id = _clean_text(workflow.get("channel_id"))
+        thread_id = _clean_text(workflow.get("thread_id"))
+        user_id = _clean_text(workflow.get("user_id"))
+        requester_id = _clean_text(workflow.get("requester_id"))
+
+        # First attempt: resolve from Cortex memory context.
+        if self._planner:
+            try:
+                memory = await self._planner.fetch_memory_context(user_id=user_id)
+                resolved = await self._planner.answer_followup_from_memory(question, memory)
+                if resolved.get("found") and resolved.get("confidence", 0.0) >= 0.65:
+                    answer = resolved.get("answer")
+                    input_data = step.get("input_data", {})
+                    if not isinstance(input_data, dict):
+                        input_data = {}
+                    patched = self._apply_followup_answer_to_input(
+                        input_data, field_name, question_id, answer
+                    )
+                    await asyncio.to_thread(
+                        self._store.update_step_input, task_id, step_index, patched
+                    )
+                    await asyncio.to_thread(
+                        self._store.set_status, task_id, "running", None
+                    )
+                    await self._emit_workflow_event(ws, {
+                        "event": "followup_resolved_from_context",
+                        "task_id": task_id,
+                        "step_id": step.get("step_id"),
+                        "step_order": step_index + 1,
+                        "question_id": question_id,
+                        "field_name": field_name,
+                        "workflow_status": "running",
+                    })
+                    asyncio.create_task(
+                        self._dispatch_step(ws, task_id, step_index),
+                        name=f"followup-retry-{task_id[:8]}-{step_index}",
+                    )
+                    return
+            except Exception as exc:
+                logger.warning("Failed to resolve follow-up from Cortex: %s", exc)
+
+        if not channel_id:
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg=f"Follow-up needed but no user channel available: {question}",
+                duration_ms=0,
+            )
+            return
+
+        choices_hint = f"\nOptions: {', '.join(choices)}" if choices else ""
+        prompt = (
+            f"I need one detail to continue workflow step {step_index + 1} "
+            f"({step.get('name') or step.get('capability')}).\n"
+            f"Question: {question}"
+            f"{choices_hint}\n"
+            "Please reply in this thread."
+        )
+        pending_id = str(uuid.uuid4())
+        await asyncio.to_thread(
+            self._store.save_pending_followup,
+            pending_id,
+            task_id,
+            step_index,
+            _clean_text(step.get("step_id")),
+            _clean_text(step.get("capability")),
+            question_id,
+            question,
+            field_name,
+            answer_format,
+            json.dumps(choices),
+            thread_id,
+            channel_id,
+            requester_id,
+            user_id,
+        )
+        await asyncio.to_thread(
+            self._store.set_status,
+            task_id,
+            "awaiting_followup",
+            f"Awaiting follow-up answer: {question}",
+        )
+        await self._emit_workflow_event(ws, {
+            "event": "followup_requested",
+            "task_id": task_id,
+            "step_id": step.get("step_id"),
+            "step_order": step_index + 1,
+            "question_id": question_id,
+            "question": question,
+            "field_name": field_name,
+            "workflow_status": "awaiting_followup",
+        })
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text=prompt,
+        )
+
+    async def _handle_followup_reply(
+        self,
+        ws,
+        user_reply: str,
+        pending: dict,
+        channel_id: str,
+        thread_id: str,
+        user_id: str,
+    ) -> tuple[dict | None, str | None]:
+        task_id = _clean_text(pending.get("task_id"))
+        step_index = int(pending.get("step_index") or 0)
+        question_id = _clean_text(pending.get("question_id"))
+        field_name = _clean_text(pending.get("field_name"))
+        answer_format = _clean_text(pending.get("answer_format")).lower() or "text"
+        try:
+            choices = json.loads(pending.get("choices_json") or "[]")
+            if not isinstance(choices, list):
+                choices = []
+        except Exception:
+            choices = []
+        answer, err = _normalise_followup_answer(
+            user_reply, answer_format, [str(c) for c in choices]
+        )
+        if err:
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=err,
+            )
+            return {
+                "task_id": task_id,
+                "status": "awaiting_followup",
+                "message": "Waiting for valid follow-up answer",
+            }, None
+
+        workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
+        if not workflow:
+            await asyncio.to_thread(self._store.delete_pending_followup, pending.get("id"))
+            return None, f"Workflow {task_id} not found for pending follow-up"
+        steps = workflow.get("steps", [])
+        if step_index < 0 or step_index >= len(steps):
+            await asyncio.to_thread(self._store.delete_pending_followup, pending.get("id"))
+            return None, f"Step index {step_index} out of range for follow-up"
+
+        step = steps[step_index]
+        input_data = step.get("input_data", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        patched = self._apply_followup_answer_to_input(
+            input_data, field_name, question_id, answer
+        )
+        await asyncio.to_thread(
+            self._store.update_step_input, task_id, step_index, patched
+        )
+        await asyncio.to_thread(
+            self._store.delete_pending_followup, pending.get("id")
+        )
+        await asyncio.to_thread(
+            self._store.set_status, task_id, "running", None
+        )
+        await self._emit_workflow_event(ws, {
+            "event": "followup_answer_received",
+            "task_id": task_id,
+            "step_id": step.get("step_id"),
+            "step_order": step_index + 1,
+            "question_id": question_id,
+            "field_name": field_name,
+            "workflow_status": "running",
+        })
+        asyncio.create_task(
+            self._dispatch_step(ws, task_id, step_index),
+            name=f"followup-user-retry-{task_id[:8]}-{step_index}",
+        )
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text="Thanks. Continuing with that answer.",
+        )
+        return {
+            "task_id": task_id,
+            "status": "running",
+            "message": "Follow-up answered and step resumed",
+        }, None
+
+    async def _handle_memory_consent_reply(
+        self,
+        user_reply: str,
+        pending: dict,
+        channel_id: str,
+        thread_id: str,
+        user_id: str,
+    ) -> tuple[dict | None, str | None]:
+        """Handle yes/no reply for storing sensitive memory entries."""
+        decision = _parse_yes_no_reply(user_reply)
+        if decision is None:
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text="Please reply with `yes` or `no` for storing sensitive memory.",
+            )
+            return {
+                "status": "awaiting_memory_consent",
+                "message": "Waiting for explicit yes/no consent",
+            }, None
+
+        consent_id = _clean_text(pending.get("id"))
+        await asyncio.to_thread(self._store.delete_pending_memory_consent, consent_id)
+
+        if decision is False:
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text="Acknowledged. Sensitive information was not stored in Cortex.",
+            )
+            return {
+                "status": "memory_consent_denied",
+                "message": "Sensitive entries skipped",
+            }, None
+
+        try:
+            entries = json.loads(pending.get("entries_json", "[]"))
+            if not isinstance(entries, list):
+                entries = []
+        except Exception:
+            entries = []
+
+        if entries and self._planner:
+            asyncio.create_task(
+                self._planner.write_memory_entries(
+                    user_entries=[e for e in entries if isinstance(e, dict)],
+                    user_id=_clean_text(pending.get("user_id")),
+                    planner_entries=None,
+                ),
+                name=f"cortex-sensitive-consent-{consent_id[:8]}",
+            )
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text=(
+                f"Acknowledged. Stored {len(entries)} sensitive entr"
+                f"{'ies' if len(entries) != 1 else 'y'} in Cortex with your consent."
+            ),
+        )
+        return {
+            "status": "memory_consent_approved",
+            "message": "Sensitive entries stored",
+        }, None
 
     # ── Reconnect: resume stalled workflows ────────────────────────────────────
 
@@ -1059,6 +1766,15 @@ class OrchestratorClient:
         deleted = await asyncio.to_thread(self._store.cleanup_stale_clarifications)
         if deleted:
             logger.info("Cleaned up %d stale pending clarification(s)", deleted)
+        deleted_replans = await asyncio.to_thread(self._store.cleanup_stale_replan_approvals)
+        if deleted_replans:
+            logger.info("Cleaned up %d stale pending replan approval(s)", deleted_replans)
+        deleted_followups = await asyncio.to_thread(self._store.cleanup_stale_followups)
+        if deleted_followups:
+            logger.info("Cleaned up %d stale pending follow-up(s)", deleted_followups)
+        deleted_consents = await asyncio.to_thread(self._store.cleanup_stale_memory_consents)
+        if deleted_consents:
+            logger.info("Cleaned up %d stale pending memory consent(s)", deleted_consents)
 
         running = await asyncio.to_thread(self._store.list_running)
         if not running:
