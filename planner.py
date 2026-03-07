@@ -12,6 +12,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -31,7 +32,16 @@ _SENSITIVE_KEYWORDS = (
     "routing number", "dob", "date of birth", "medical", "diagnosis",
 )
 
-_PLAN_SYSTEM_PROMPT = """\
+_PROMPT_FILE = Path(__file__).parent / "prompts" / "system_prompt.md"
+
+
+def _load_plan_system_prompt() -> str:
+    try:
+        return _PROMPT_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    # inline fallback (same content as the MD file)
+    return """\
 You are a workflow planning AI. Output valid JSON only — no extra text:
 {
   "title": "Short title (max 60 chars)",
@@ -63,8 +73,10 @@ Rules:
 - Slack output: never hardcode field refs in send_slack_message. Insert format_step_output
   before it (input_data.data={{steps[N].output}}, input_data.capability_name=<step N cap>);
   the send step uses {{steps[K].output.text}}. Only use it for user-facing messages.
-- Final step: always send a completion message via a messaging capability using
-  REPLY_CHANNEL_ID and REPLY_THREAD_ID from the request context.
+- Final step: if REPLY_CHANNEL_ID is present, always send a completion message via a
+  messaging capability using REPLY_CHANNEL_ID and REPLY_THREAD_ID. If SOURCE=avatar or
+  no REPLY_CHANNEL_ID is set, do NOT add a messaging final step — the avatar interface
+  handles result delivery automatically.
 - If request preferences include DELIVERY_CHANNEL, prefer that channel's messaging
   capability for the final completion step when available:
   slack -> send_slack_message, email -> send_email, telegram -> send_telegram_message,
@@ -79,6 +91,9 @@ Rules:
 - User-provided info (e.g. "Tesla" answering "What car?"): one step — confirm and store
   in memory_entries. Do not research or act on the info further.
 """
+
+
+_PLAN_SYSTEM_PROMPT: str = _load_plan_system_prompt()
 
 
 _CLARIFICATION_SYSTEM_PROMPT = """\
@@ -148,33 +163,72 @@ class TaskPlanner:
         self._base = orchestrator_base_url.rstrip("/")
         self._agent_id = agent_id
         self._proxy_url = f"{self._base}/api/v1/llm/complete"
+        self._default_model = model
         self._model = model
+        self._provider = "anthropic"
         self._max_tokens = max_tokens
+
+        # System prompt (hot-reloadable via update_prompt)
+        self._plan_system_prompt: str = _PLAN_SYSTEM_PROMPT
 
         # Capability cache: (fetch_time, agents_list)
         self._caps_cache_time: float = 0.0
         self._caps_cache: list[dict] = []
+
+        # Agent metadata cache: agent_name → metadata dict (refreshed with capability cache)
+        self._agent_meta_cache: dict[str, dict] = {}
 
         # Vector search settings — updated live via update_settings()
         self._vector_search_enabled: bool = False
         self._vector_search_top_k: int = 8
         self._vector_search_multiphase: bool = False
 
-    def update_settings(self, settings: dict) -> None:
-        """Apply common_settings pushed from the orchestrator."""
-        raw_enabled = str(settings.get("vector_search_enabled", "false")).lower().strip()
+    def update_prompt(self, content: str) -> None:
+        """Hot-reload the planning system prompt (called on prompt_push from orchestrator)."""
+        if content and content.strip():
+            self._plan_system_prompt = content.strip()
+            logger.info("Plan system prompt updated (%d chars)", len(self._plan_system_prompt))
+
+    def update_settings(self, common_settings: dict, agent_settings: dict | None = None) -> None:
+        """Apply common_settings and agent-specific settings pushed from the orchestrator."""
+        agent_settings = agent_settings or {}
+
+        # ── Model / provider resolution ────────────────────────────────────────
+        # Priority: agent setting → global default → compiled-in default
+        for candidate in (
+            str(agent_settings.get("planner_model", "")).strip(),
+            str(common_settings.get("default_model", "")).strip(),
+            self._default_model,
+        ):
+            if candidate:
+                self._model = candidate
+                break
+
+        for candidate in (
+            str(agent_settings.get("planner_provider", "")).strip(),
+            str(common_settings.get("default_provider", "")).strip(),
+        ):
+            if candidate:
+                self._provider = candidate
+                break
+        else:
+            self._provider = "anthropic"
+
+        # ── Vector search ──────────────────────────────────────────────────────
+        raw_enabled = str(common_settings.get("vector_search_enabled", "false")).lower().strip()
         self._vector_search_enabled = raw_enabled in ("true", "1", "yes")
 
-        raw_multiphase = str(settings.get("vector_search_multiphase", "false")).lower().strip()
+        raw_multiphase = str(common_settings.get("vector_search_multiphase", "false")).lower().strip()
         self._vector_search_multiphase = raw_multiphase in ("true", "1", "yes")
 
         try:
-            self._vector_search_top_k = max(3, int(settings.get("vector_search_top_k", 8)))
+            self._vector_search_top_k = max(3, int(common_settings.get("vector_search_top_k", 8)))
         except (ValueError, TypeError):
             self._vector_search_top_k = 8
 
         logger.info(
-            "Planner settings updated: vector_search=%s top_k=%d multiphase=%s",
+            "Planner settings updated: model=%s provider=%s vector_search=%s top_k=%d multiphase=%s",
+            self._model, self._provider,
             self._vector_search_enabled, self._vector_search_top_k, self._vector_search_multiphase,
         )
 
@@ -185,6 +239,7 @@ class TaskPlanner:
                 self._proxy_url,
                 headers={"X-Agent-Id": self._agent_id},
                 json={
+                    "provider": self._provider,
                     "model": self._model,
                     "messages": messages,
                     "system": system,
@@ -295,7 +350,7 @@ class TaskPlanner:
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
-                list_resp = await http.get(f"{self._base}/api/v1/agents")
+                list_resp = await http.get(f"{self._base}/api/v1/agents", params={"active": "true"})
                 if list_resp.status_code != 200:
                     return self._caps_cache  # return stale on error
 
@@ -311,6 +366,11 @@ class TaskPlanner:
 
             self._caps_cache = full_agents
             self._caps_cache_time = time.monotonic()
+            # Refresh agent metadata cache for path-constraint injection
+            self._agent_meta_cache = {
+                a.get("name", ""): a.get("metadata") or {}
+                for a in full_agents
+            }
             logger.info("Capability cache refreshed: %d agent(s)", len(full_agents))
             return full_agents
 
@@ -381,6 +441,11 @@ class TaskPlanner:
                 lines.append("    Cost: free")
             else:
                 lines.append(f"    Cost: ${cost_usd:.4f}/call")
+            agent_meta = self._agent_meta_cache.get(agent_name, {})
+            path_constraint = agent_meta.get("fs_allowed_paths") or None
+            if path_constraint:
+                roots_str = ", ".join(str(p) for p in path_constraint)
+                lines.append(f"    Path constraint: ALL file paths MUST be within: {roots_str}")
             if props:
                 lines.append("    Input fields:")
                 for field_name, field_info in props.items():
@@ -542,6 +607,7 @@ class TaskPlanner:
                 continue
             if agent.get("disabled"):
                 continue
+            agent_metadata = agent.get("metadata") or {}
             for cap in agent.get("capabilities", []):
                 if isinstance(cap, dict):
                     cap_name = cap.get("name", "")
@@ -567,6 +633,8 @@ class TaskPlanner:
                 if not cap_name:
                     continue
                 optional_fields = [f for f in properties.keys() if f not in required_fields]
+                # Carry path constraint from agent metadata (set by filesystem-agent)
+                path_constraint = agent_metadata.get("fs_allowed_paths") or None
                 caps.append({
                     "agent_name": agent_name,
                     "capability_name": cap_name,
@@ -578,6 +646,7 @@ class TaskPlanner:
                     "cost_usd": cost_usd,
                     "cost_note": cost_note,
                     "properties": properties,
+                    "path_constraint": path_constraint,
                 })
         return caps
 
@@ -668,6 +737,10 @@ class TaskPlanner:
             else:
                 note = f" ({cost_note})" if cost_note else ""
                 lines.append(f"    Cost: ${cost_usd:.4f}/call{note}")
+            path_constraint = cap.get("path_constraint")
+            if path_constraint:
+                roots_str = ", ".join(str(p) for p in path_constraint)
+                lines.append(f"    Path constraint: ALL file paths MUST be within: {roots_str}")
             if properties:
                 lines.append("    Input fields:")
                 fields = list(required_fields)
@@ -789,6 +862,7 @@ class TaskPlanner:
         delivery_channel: str = "",
         persona: str = "",
         summary_format: str = "",
+        source: str = "",
         memory_context: str = "",
         clarification_message: str = "",
         clarification_answers: str = "",
@@ -847,6 +921,8 @@ class TaskPlanner:
         )
 
         reply_context_lines: list[str] = [f"REQUESTER_ID: {requester_id}"]
+        if source:
+            reply_context_lines.append(f"SOURCE: {source}")
         if channel_id:
             reply_context_lines.append(f"REPLY_CHANNEL_ID: {channel_id}")
         if thread_id:
@@ -906,7 +982,7 @@ class TaskPlanner:
             messages = [{"role": "user", "content": user_msg}]
         raw_text: str = await self._proxy_complete(
             messages=messages,
-            system=_PLAN_SYSTEM_PROMPT,
+            system=self._plan_system_prompt,
             max_tokens=self._max_tokens,
         )
         logger.debug("LLM response: %s", raw_text[:500])

@@ -246,10 +246,19 @@ AGENT_DESCRIPTION = (
     "to the appropriate agent and resuming on callback."
 )
 
+def _load_default_prompt() -> str:
+    _pf = Path(__file__).parent / "prompts" / "system_prompt.md"
+    try:
+        return _pf.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
 REGISTRATION_PAYLOAD: dict = {
-    "name":        AGENT_NAME,
-    "description": AGENT_DESCRIPTION,
-    "version":     AGENT_VERSION,
+    "name":           AGENT_NAME,
+    "description":    AGENT_DESCRIPTION,
+    "version":        AGENT_VERSION,
+    "default_prompt": _load_default_prompt(),
     "capabilities": [
         {
             "name": "plan_task",
@@ -401,7 +410,31 @@ REGISTRATION_PAYLOAD: dict = {
         "llm_calls_per_plan": 1,
         "persistence": "sqlite",
     },
-    "required_settings": [],
+    "required_settings": [
+        {
+            "key": "planner_model",
+            "label": "Model",
+            "type": "string",
+            "required": False,
+            "description": (
+                "LLM model for workflow planning. "
+                "Leave empty to use the global default model. "
+                "Examples: claude-sonnet-4-6, claude-opus-4-6, gpt-4o"
+            ),
+            "default": "",
+        },
+        {
+            "key": "planner_provider",
+            "label": "Provider",
+            "type": "string",
+            "required": False,
+            "description": (
+                "LLM provider: anthropic, openai, or gemini. "
+                "Leave empty to use the global default provider."
+            ),
+            "default": "",
+        },
+    ],
 }
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -473,6 +506,8 @@ class OrchestratorClient:
         self._store: WorkflowStore = WorkflowStore()
         self._planner: Optional[TaskPlanner] = None
         self._common_settings: dict = {}
+        self._agent_settings: dict = {}
+        self._registered_prompt: str = ""
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -487,7 +522,9 @@ class OrchestratorClient:
             orchestrator_base_url=self._base,
             agent_id=self._agent_id,
         )
-        self._planner.update_settings(self._common_settings)
+        self._planner.update_settings(self._common_settings, self._agent_settings)
+        if self._registered_prompt:
+            self._planner.update_prompt(self._registered_prompt)
         await self._connect_loop()
 
     # ── Registration ───────────────────────────────────────────────────────────
@@ -499,9 +536,11 @@ class OrchestratorClient:
         resp = await self._http.post(url, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        self._agent_id      = data["agent_id"]
-        self._ws_url        = data["ws_url"]
+        self._agent_id        = data["agent_id"]
+        self._ws_url          = data["ws_url"]
         self._common_settings = data.get("common_settings", {})
+        self._agent_settings  = data.get("agent_settings", {})
+        self._registered_prompt = data.get("system_prompt", "")
         logger.info("Registered — agent_id=%s", self._agent_id)
 
     # ── WebSocket loop ─────────────────────────────────────────────────────────
@@ -630,8 +669,17 @@ class OrchestratorClient:
         elif mtype == "settings_push":
             logger.info("Settings pushed: %d key(s)", len(payload))
             self._common_settings.update(payload)
+            for k in ("planner_model", "planner_provider"):
+                if k in payload:
+                    self._agent_settings[k] = payload[k]
             if self._planner is not None:
-                self._planner.update_settings(self._common_settings)
+                self._planner.update_settings(self._common_settings, self._agent_settings)
+
+        elif mtype == "prompt_push":
+            content = payload.get("content", "")
+            if content and self._planner is not None:
+                self._planner.update_prompt(content)
+                logger.info("Prompt push received (%d chars)", len(content))
 
         elif mtype == "error":
             logger.error("Orchestrator error [%s]: %s",
@@ -731,6 +779,7 @@ class OrchestratorClient:
         delivery_channel = _clean_text(input_data.get("delivery_channel")).lower()
         persona = _clean_text(input_data.get("persona"))
         summary_format = _clean_text(input_data.get("summary_format"))
+        source = _clean_text(input_data.get("source"))
         payload = input_data.get("payload")
         if isinstance(payload, dict):
             if not channel_id:
@@ -906,6 +955,7 @@ class OrchestratorClient:
                 delivery_channel=delivery_channel,
                 persona=persona,
                 summary_format=summary_format,
+                source=source,
                 memory_context=memory_context,        # reuse already-fetched context
                 clarification_message=clarification_message,  # "" for fresh requests
                 clarification_answers=clarification_answers,  # "" for fresh requests
@@ -985,6 +1035,7 @@ class OrchestratorClient:
             delivery_channel=delivery_channel,
             persona=persona,
             summary_format=summary_format,
+            source=source,
         )
         await asyncio.to_thread(self._store.set_status, plan.task_id, "running")
 
@@ -1193,6 +1244,13 @@ class OrchestratorClient:
                     name=f"cortex-complete-{task_id[:8]}",
                 )
 
+                # Notify source channel of completion result
+                updated_workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
+                asyncio.create_task(
+                    self._notify_source_of_completion(ws, task_id, updated_workflow or workflow),
+                    name=f"notify-complete-{task_id[:8]}",
+                )
+
         else:
             # Step failed — persist and abort
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
@@ -1254,104 +1312,130 @@ class OrchestratorClient:
             "workflow_status": "failed",
         })
 
-        channel_id = _clean_text(workflow.get("channel_id"))
-        thread_id = _clean_text(workflow.get("thread_id"))
-        user_id = _clean_text(workflow.get("user_id"))
-        goal = _clean_text(workflow.get("goal"))
-        if not channel_id:
-            # Without a channel we cannot request permission interactively.
-            return
+        channel_id   = _clean_text(workflow.get("channel_id"))
+        thread_id    = _clean_text(workflow.get("thread_id"))
+        user_id      = _clean_text(workflow.get("user_id"))
+        source       = _clean_text(workflow.get("source"))
+        requester_id = _clean_text(workflow.get("requester_id"))
+        goal         = _clean_text(workflow.get("goal"))
 
-        summary = (
-            f"Workflow failed.\n"
-            f"- Task: {workflow.get('title') or task_id}\n"
-            f"- Failed step: {step_index + 1}/{total} — {step_name} ({capability})\n"
-            f"- Error: {err_msg}"
-        )
-        await self._send_clarification_message(
-            channel_id=channel_id,
-            thread_ts=thread_id,
-            user_id=user_id,
-            text=summary,
+        failure_summary = (
+            f"Step {step_index + 1}/{total} ({step_name}) failed: {err_msg}"
         )
 
-        replan_count = int(workflow.get("replan_count") or 0)
-        if replan_count >= MAX_REPLAN_ATTEMPTS or not self._planner:
+        # Notify the source channel of the failure
+        if channel_id:
             await self._send_clarification_message(
                 channel_id=channel_id,
                 thread_ts=thread_id,
                 user_id=user_id,
-                text=(
-                    f"Automatic re-plan limit reached ({replan_count}/{MAX_REPLAN_ATTEMPTS}) "
-                    "or planner unavailable. Please provide new instructions."
-                ),
+                text=f"Workflow hit an error — {failure_summary}. Trying a revised plan…",
             )
+        elif source == "avatar" and requester_id:
+            asyncio.create_task(
+                self._notify_avatar(requester_id, f"Ran into a problem with that — {err_msg}. Let me try a different approach…"),
+                name=f"notify-fail-avatar-{task_id[:8]}",
+            )
+
+        replan_count = int(workflow.get("replan_count") or 0)
+        if replan_count >= MAX_REPLAN_ATTEMPTS or not self._planner:
+            give_up_msg = (
+                f"Re-plan limit reached ({replan_count}/{MAX_REPLAN_ATTEMPTS}). "
+                "Unable to complete the task automatically."
+            )
+            logger.warning("Workflow %s: %s", task_id[:8], give_up_msg)
+            if channel_id:
+                await self._send_clarification_message(
+                    channel_id=channel_id,
+                    thread_ts=thread_id,
+                    user_id=user_id,
+                    text=give_up_msg,
+                )
+            elif source == "avatar" and requester_id:
+                asyncio.create_task(
+                    self._notify_avatar(requester_id, give_up_msg),
+                    name=f"notify-giveup-avatar-{task_id[:8]}",
+                )
             return
 
+        # Auto-replan without user approval
         failure_context_goal = (
             f"{goal}\n\n"
-            f"Previous attempt failed.\n"
-            f"Failure step: {step_index + 1}/{total} ({step_name}, capability={capability}).\n"
+            f"Previous attempt failed at step {step_index + 1}/{total} "
+            f"({step_name}, capability={capability}).\n"
             f"Error: {err_msg}\n"
             "Create an alternative plan that avoids the failed path and still achieves the goal."
         )
+        next_replan_count = replan_count + 1
         try:
             replan = await self._planner.plan(
                 goal=failure_context_goal,
-                requester_id=_clean_text(workflow.get("requester_id")),
+                requester_id=requester_id,
                 channel_id=channel_id,
                 thread_id=thread_id,
                 user_id=user_id,
                 delivery_channel=_clean_text(workflow.get("delivery_channel")),
                 persona=_clean_text(workflow.get("persona")),
                 summary_format=_clean_text(workflow.get("summary_format")),
+                source=source,
             )
         except Exception as exc:
             logger.warning("Workflow %s re-plan generation failed: %s", task_id[:8], exc)
-            await self._send_clarification_message(
-                channel_id=channel_id,
-                thread_ts=thread_id,
-                user_id=user_id,
-                text=f"Could not generate a revised plan automatically: {exc}",
-            )
+            err_text = f"Could not generate a revised plan: {exc}"
+            if channel_id:
+                await self._send_clarification_message(
+                    channel_id=channel_id, thread_ts=thread_id, user_id=user_id, text=err_text,
+                )
+            elif source == "avatar" and requester_id:
+                asyncio.create_task(
+                    self._notify_avatar(requester_id, err_text),
+                    name=f"notify-replan-err-avatar-{task_id[:8]}",
+                )
             return
 
         replanned_steps = [s.to_dict() for s in replan.steps]
         _inject_slack_user_id(replanned_steps, user_id)
-        next_replan_count = replan_count + 1
-        prompt = (
-            f"{summary}\n\n"
-            f"I created a revised plan (attempt {next_replan_count}/{MAX_REPLAN_ATTEMPTS}) "
-            f"with {len(replanned_steps)} step(s).\n"
-            "Reply `yes` to continue with the revised plan, or `no` to stop."
-        )
-        approval_id = str(uuid.uuid4())
+
         await asyncio.to_thread(
-            self._store.save_pending_replan_approval,
-            approval_id,
+            self._store.replace_workflow_plan,
             task_id,
-            thread_id,
-            channel_id,
-            _clean_text(workflow.get("requester_id")),
-            user_id,
-            next_replan_count,
-            prompt,
             failure_context_goal,
             replan.title,
             replan.description,
-            json.dumps(replanned_steps),
+            replanned_steps,
+            next_replan_count,
         )
-        await asyncio.to_thread(
-            self._store.set_status,
-            task_id,
-            "awaiting_replan_approval",
-            f"Awaiting user approval for re-plan attempt {next_replan_count}",
+        await self._emit_workflow_event(ws, {
+            "event":           "workflow_started",
+            "task_id":         task_id,
+            "title":           replan.title,
+            "description":     replan.description,
+            "goal":            failure_context_goal,
+            "total_steps":     len(replanned_steps),
+            "workflow_status": "running",
+        })
+
+        retry_msg = (
+            f"Revised plan ready ({next_replan_count}/{MAX_REPLAN_ATTEMPTS}) "
+            f"— {len(replanned_steps)} step(s). Continuing now…"
         )
-        await self._send_clarification_message(
-            channel_id=channel_id,
-            thread_ts=thread_id,
-            user_id=user_id,
-            text=prompt,
+        if channel_id:
+            await self._send_clarification_message(
+                channel_id=channel_id, thread_ts=thread_id, user_id=user_id, text=retry_msg,
+            )
+        elif source == "avatar" and requester_id:
+            asyncio.create_task(
+                self._notify_avatar(requester_id, retry_msg),
+                name=f"notify-retry-avatar-{task_id[:8]}",
+            )
+
+        asyncio.create_task(
+            self._dispatch_step(ws, task_id, 0),
+            name=f"replan-step-{task_id[:8]}-0",
+        )
+        logger.info(
+            "Workflow %s auto-replanned (attempt %d/%d): %d step(s)",
+            task_id[:8], next_replan_count, MAX_REPLAN_ATTEMPTS, len(replanned_steps),
         )
 
     async def _handle_replan_approval_reply(
@@ -1874,6 +1958,72 @@ class OrchestratorClient:
             logger.error("Discovery request failed: %s", exc)
         return None
 
+    # ── Source completion notification ─────────────────────────────────────────
+
+    async def _notify_source_of_completion(
+        self, ws, task_id: str, workflow: dict
+    ) -> None:
+        """
+        After all steps succeed, push the result back to the originating source.
+        For avatar: sends talk_to_avatar to the requester agent.
+        For Slack: the plan's final send_slack_message step already handles delivery.
+        """
+        source       = _clean_text(workflow.get("source"))
+        requester_id = _clean_text(workflow.get("requester_id"))
+        channel_id   = _clean_text(workflow.get("channel_id"))
+
+        if not source and not requester_id:
+            return
+
+        # Build result text from the last successful step output
+        outputs: list = []
+        try:
+            outputs = json.loads(workflow.get("outputs_json") or "[]") or []
+        except Exception:
+            pass
+
+        result_text = ""
+        for output in reversed(outputs):
+            if not isinstance(output, dict):
+                continue
+            for key in ("result", "response", "message", "summary", "text", "content"):
+                val = output.get(key)
+                if isinstance(val, str) and val.strip():
+                    result_text = val.strip()
+                    break
+            if result_text:
+                break
+
+        wf_title = workflow.get("title") or "Your task"
+        if not result_text:
+            result_text = f"'{wf_title}' completed successfully."
+
+        if source == "avatar" and requester_id and not channel_id:
+            await self._notify_avatar(requester_id, result_text)
+
+    async def _notify_avatar(self, avatar_agent_id: str, message: str) -> None:
+        """Send a talk_to_avatar task_request directly to the avatar agent."""
+        ws_ref = self._current_ws
+        if not ws_ref:
+            logger.warning("Cannot notify avatar — WS not connected")
+            return
+        req_id = str(uuid.uuid4())
+        try:
+            await self._ws_send(ws_ref, _envelope(
+                sender_id=self._agent_id,
+                msg_type="task_request",
+                payload={
+                    "capability": "talk_to_avatar",
+                    "input_data": {"message": message},
+                    "timeout_ms": 30_000,
+                },
+                recipient_id=avatar_agent_id,
+                msg_id=req_id,
+            ))
+            logger.info("Sent talk_to_avatar result to agent %s", avatar_agent_id[:8])
+        except Exception as exc:
+            logger.warning("Failed to notify avatar agent: %s", exc)
+
     # ── Clarification message ──────────────────────────────────────────────────
 
     async def _send_clarification_message(
@@ -1998,6 +2148,8 @@ class OrchestratorClient:
         )
         try:
             await ws.send(msg_str)
+        except websockets.exceptions.ConnectionClosed:
+            raise  # propagate → heartbeat loop exits → asyncio.gather raises → reconnect
         except Exception as exc:
             logger.warning("WS send failed: %s", exc)
 
