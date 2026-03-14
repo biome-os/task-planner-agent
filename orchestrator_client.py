@@ -1268,6 +1268,14 @@ class OrchestratorClient:
                     ),
                     name=f"cortex-complete-{task_id[:8]}",
                 )
+                asyncio.create_task(
+                    self._write_cortex_entry(
+                        "__global__",
+                        "Patterns",
+                        f"Workflow '{wf_title}' succeeded ({total} steps) — goal: {wf_goal}",
+                    ),
+                    name=f"cortex-global-complete-{task_id[:8]}",
+                )
 
                 # Notify source channel of completion result
                 updated_workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
@@ -1684,6 +1692,19 @@ class OrchestratorClient:
                         "agent_capability": agent_capability,
                         "workflow_status": "running",
                     })
+                    # Store the resolved answer in global memory so future
+                    # workflows can resolve the same question from Cortex
+                    # without needing another agent or human in the loop.
+                    if field_name and agent_answer:
+                        _safe_answer = str(agent_answer)[:200]
+                        asyncio.create_task(
+                            self._write_cortex_entry(
+                                "__global__",
+                                "Facts",
+                                f"{field_name}: {_safe_answer} (resolved via {agent_capability})",
+                            ),
+                            name=f"cortex-global-followup-{task_id[:8]}",
+                        )
                     asyncio.create_task(
                         self._dispatch_step(ws, task_id, step_index),
                         name=f"followup-agent-retry-{task_id[:8]}-{step_index}",
