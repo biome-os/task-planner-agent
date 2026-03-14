@@ -26,6 +26,10 @@ _CAPS_CACHE_TTL_S: float = 60.0   # re-fetch agents at most once per minute
 _COMPACT_CAP_LIMIT: int = 10
 _MAX_OPTIONAL_FIELDS_PER_CAP: int = 2
 _MAX_MEMORY_CONTEXT_CHARS: int = 1200
+_TYPE_ABBREV: dict[str, str] = {
+    "string": "str", "integer": "int", "number": "num",
+    "boolean": "bool", "object": "obj", "array": "arr",
+}
 _SENSITIVE_KEYWORDS = (
     "password", "passcode", "otp", "token", "api key", "secret", "ssn",
     "social security", "credit card", "card number", "cvv", "bank account",
@@ -253,7 +257,7 @@ class TaskPlanner:
     async def fetch_memory_context(self, user_id: str = "") -> str:
         """
         Fetch Cortex memory to inject into the planning prompt.
-        Pulls global memory and (if user_id is provided) user-specific memory.
+        Pulls global memory (which includes user profile facts from all channels).
         Fails silently — memory is advisory context, never critical.
         """
         parts: list[str] = []
@@ -269,21 +273,7 @@ class TaskPlanner:
                 except Exception as exc:
                     logger.debug("Could not fetch global Cortex memory: %s", exc)
 
-                # User-specific memory (keyed by Slack user_id if available)
-                if user_id:
-                    namespace = f"slack-user-{user_id}"
-                    try:
-                        r = await http.get(
-                            f"{self._base}/api/v1/cortex/agents/{namespace}"
-                        )
-                        if r.status_code == 200:
-                            content = r.json().get("content", "").strip()
-                            if content and "## " in content:
-                                parts.append(
-                                    f"=== User Memory (id: {user_id}) ===\n{content}"
-                                )
-                    except Exception as exc:
-                        logger.debug("Could not fetch user Cortex memory: %s", exc)
+                # User profile facts are stored in global memory (channel-agnostic)
         except Exception as exc:
             logger.debug("Memory context fetch failed: %s", exc)
 
@@ -296,29 +286,27 @@ class TaskPlanner:
         planner_entries: list[dict] | None = None,
     ) -> None:
         """
-        Write memory entries to the user namespace and/or the planner namespace.
-        All writes are best-effort — failures are logged and silently ignored.
-        user_entries: [{category, content}] → written to slack-user-{user_id}
+        Write memory entries to Cortex. All writes are best-effort — failures are logged and silently ignored.
+        user_entries: [{category, content}] → written to __global__ (channel-agnostic, visible to all agents)
         planner_entries: [{category, content}] → written to task-planner-agent
         """
         async with httpx.AsyncClient(timeout=5.0) as http:
-            if user_id and user_entries:
-                namespace = f"slack-user-{user_id}"
+            if user_entries:
                 for entry in user_entries:
                     try:
                         await http.post(
-                            f"{self._base}/api/v1/cortex/agents/{namespace}/entries",
+                            f"{self._base}/api/v1/cortex/agents/__global__/entries",
                             json={
                                 "category": entry.get("category", "Facts"),
                                 "content": entry["content"],
                             },
                         )
                         logger.debug(
-                            "Wrote user memory entry [%s]: %s",
+                            "Wrote user memory entry to global [%s]: %s",
                             entry.get("category"), entry["content"][:60],
                         )
                     except Exception as exc:
-                        logger.debug("Failed to write user memory entry: %s", exc)
+                        logger.debug("Failed to write user memory entry to global: %s", exc)
 
             if planner_entries:
                 for entry in planner_entries:
@@ -409,10 +397,12 @@ class TaskPlanner:
         return []
 
     def _format_semantic_caps(self, results: list[dict], goal: str = "") -> str:
-        """Format vector-search results into the same capability text the LLM expects."""
+        """Format vector-search results using the compact single-line style."""
         skip_agents = {"task-planner-agent", "task-executor-agent"}
-        lines: list[str] = []
+        from collections import defaultdict
+        by_agent: dict[str, list[dict]] = defaultdict(list)
         seen: set[tuple[str, str]] = set()
+
         for item in results:
             agent_name = item.get("agent_name", "unknown")
             if agent_name in skip_agents:
@@ -423,37 +413,47 @@ class TaskPlanner:
             if key in seen or not cap_name:
                 continue
             seen.add(key)
+            by_agent[agent_name].append((cap_name, cap_dict, item.get("score", 0.0)))
 
-            cap_desc = cap_dict.get("description", "")
-            schema = cap_dict.get("input_schema") or {}
-            props = schema.get("properties") or {}
-            required = list(schema.get("required") or [])
-            tags = cap_dict.get("tags") or []
-            cost = cap_dict.get("cost") or {}
-            cost_type = cost.get("type", "free")
-            cost_usd = cost.get("estimated_cost_usd")
-            score = item.get("score", 0.0)
+        if not by_agent:
+            return "  (no relevant capabilities found)"
 
-            lines.append(f"  - {cap_name} (agent: {agent_name}, relevance: {score:.2f})")
-            if cap_desc:
-                lines.append(f"    Description: {cap_desc[:160]}")
-            if cost_type == "free" or cost_usd is None:
-                lines.append("    Cost: free")
-            else:
-                lines.append(f"    Cost: ${cost_usd:.4f}/call")
-            agent_meta = self._agent_meta_cache.get(agent_name, {})
-            path_constraint = agent_meta.get("fs_allowed_paths") or None
-            if path_constraint:
-                roots_str = ", ".join(str(p) for p in path_constraint)
-                lines.append(f"    Path constraint: ALL file paths MUST be within: {roots_str}")
-            if props:
-                lines.append("    Input fields:")
-                for field_name, field_info in props.items():
-                    marker = " [REQUIRED]" if field_name in required else " [optional]"
-                    field_type = field_info.get("type", "any") if isinstance(field_info, dict) else "any"
-                    field_desc = field_info.get("description", "") if isinstance(field_info, dict) else ""
-                    lines.append(f"      - {field_name} ({field_type}){marker}: {field_desc}")
-        return "\n".join(lines) if lines else "  (no relevant capabilities found)"
+        lines: list[str] = []
+        for agent_name, agent_caps in by_agent.items():
+            lines.append(f"[{agent_name}]")
+            for cap_name, cap_dict, score in agent_caps:
+                desc = (cap_dict.get("description") or "")[:100]
+                cost = cap_dict.get("cost") or {}
+                cost_usd = cost.get("estimated_cost_usd")
+                cost_str = f"${cost_usd:.4f}" if cost_usd else "free"
+                schema = cap_dict.get("input_schema") or {}
+                props = schema.get("properties") or {}
+                required = list(schema.get("required") or [])
+                optional = [f for f in props if f not in required]
+
+                field_parts: list[str] = []
+                for f in required:
+                    fi = props.get(f) or {}
+                    ftype = _TYPE_ABBREV.get(fi.get("type", "") if isinstance(fi, dict) else "", "any")
+                    field_parts.append(f"{f}({ftype},REQ)")
+                for f in optional[:_MAX_OPTIONAL_FIELDS_PER_CAP]:
+                    fi = props.get(f) or {}
+                    ftype = _TYPE_ABBREV.get(fi.get("type", "") if isinstance(fi, dict) else "", "any")
+                    field_parts.append(f"{f}({ftype})")
+
+                line = f"  {cap_name} ({cost_str}, relevance:{score:.2f})"
+                if desc:
+                    line += f": {desc}"
+                if field_parts:
+                    line += f" → {', '.join(field_parts)}"
+                lines.append(line)
+
+                agent_meta = self._agent_meta_cache.get(agent_name, {})
+                path_constraint = agent_meta.get("fs_allowed_paths") or None
+                if path_constraint:
+                    roots_str = ", ".join(str(p) for p in path_constraint)
+                    lines.append(f"    [paths must be within: {roots_str}]")
+        return "\n".join(lines)
 
     # ── Multi-phase goal decomposition ─────────────────────────────────────
 
@@ -716,6 +716,63 @@ class TaskPlanner:
 
     def _format_capabilities(self, agents: list[dict], goal: str = "", compact: bool = False) -> str:
         caps = self._select_capabilities(agents, goal) if compact else self._flatten_capabilities(agents)
+        if not caps:
+            return "  (no agents currently available)"
+        if compact:
+            return self._format_caps_compact(caps)
+        return self._format_caps_verbose(caps)
+
+    def _format_caps_compact(self, caps: list[dict]) -> str:
+        """
+        Single-line-per-capability format grouped by agent. ~60% fewer tokens than verbose.
+        Example:
+          [browser-agent]
+            browse_web (free): Navigate the web to complete a task. → task(str,REQ)
+        """
+        from collections import defaultdict
+        by_agent: dict[str, list[dict]] = defaultdict(list)
+        for cap in caps:
+            by_agent[cap["agent_name"]].append(cap)
+
+        lines: list[str] = []
+        for agent_name, agent_caps in by_agent.items():
+            lines.append(f"[{agent_name}]")
+            for cap in agent_caps:
+                cap_name = cap["capability_name"]
+                desc = (cap.get("description") or "")[:100]
+                cost_usd = cap.get("cost_usd")
+                cost_str = f"${cost_usd:.4f}" if cost_usd else "free"
+                required = cap.get("required_fields", [])
+                optional = cap.get("optional_fields", [])
+                properties = cap.get("properties", {})
+
+                field_parts: list[str] = []
+                for f in required:
+                    ftype = _TYPE_ABBREV.get(
+                        (properties.get(f) or {}).get("type", ""), "any"
+                    )
+                    field_parts.append(f"{f}({ftype},REQ)")
+                for f in optional[:_MAX_OPTIONAL_FIELDS_PER_CAP]:
+                    ftype = _TYPE_ABBREV.get(
+                        (properties.get(f) or {}).get("type", ""), "any"
+                    )
+                    field_parts.append(f"{f}({ftype})")
+
+                line = f"  {cap_name} ({cost_str})"
+                if desc:
+                    line += f": {desc}"
+                if field_parts:
+                    line += f" → {', '.join(field_parts)}"
+                lines.append(line)
+
+                path_constraint = cap.get("path_constraint")
+                if path_constraint:
+                    roots_str = ", ".join(str(p) for p in path_constraint)
+                    lines.append(f"    [paths must be within: {roots_str}]")
+        return "\n".join(lines)
+
+    def _format_caps_verbose(self, caps: list[dict]) -> str:
+        """Full multi-line format with all fields and descriptions. Used for non-compact mode."""
         lines: list[str] = []
         for cap in caps:
             cap_name = cap["capability_name"]
@@ -730,8 +787,7 @@ class TaskPlanner:
 
             lines.append(f"  - {cap_name} (agent: {agent_name})")
             if cap_desc:
-                short_desc = cap_desc if not compact else cap_desc[:140]
-                lines.append(f"    Description: {short_desc}")
+                lines.append(f"    Description: {cap_desc}")
             if cost_type == "free" or cost_usd is None:
                 lines.append("    Cost: free")
             else:
@@ -743,20 +799,12 @@ class TaskPlanner:
                 lines.append(f"    Path constraint: ALL file paths MUST be within: {roots_str}")
             if properties:
                 lines.append("    Input fields:")
-                fields = list(required_fields)
-                if compact:
-                    fields.extend(optional_fields[:_MAX_OPTIONAL_FIELDS_PER_CAP])
-                else:
-                    fields.extend(optional_fields)
-                for field_name in fields:
+                for field_name in list(required_fields) + list(optional_fields):
                     field_info = properties.get(field_name, {})
                     marker = " [REQUIRED]" if field_name in required_fields else " [optional]"
                     field_type = field_info.get("type", "any")
                     field_desc = field_info.get("description", "")
                     lines.append(f"      - {field_name} ({field_type}){marker}: {field_desc}")
-
-        if not lines:
-            return "  (no agents currently available)"
         return "\n".join(lines)
 
     def _compact_memory_context(self, memory_context: str, max_chars: int = _MAX_MEMORY_CONTEXT_CHARS) -> str:

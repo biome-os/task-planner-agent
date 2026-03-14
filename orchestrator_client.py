@@ -434,6 +434,17 @@ REGISTRATION_PAYLOAD: dict = {
             ),
             "default": "",
         },
+        {
+            "key": "planner_max_replan_attempts",
+            "label": "Max Replan Attempts",
+            "type": "integer",
+            "required": False,
+            "description": (
+                "How many times the planner may automatically revise and retry a "
+                "workflow after a step fails before giving up. Default: 3."
+            ),
+            "default": 3,
+        },
     ],
 }
 
@@ -508,6 +519,7 @@ class OrchestratorClient:
         self._common_settings: dict = {}
         self._agent_settings: dict = {}
         self._registered_prompt: str = ""
+        self._max_replan_attempts: int = MAX_REPLAN_ATTEMPTS
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -541,6 +553,12 @@ class OrchestratorClient:
         self._common_settings = data.get("common_settings", {})
         self._agent_settings  = data.get("agent_settings", {})
         self._registered_prompt = data.get("system_prompt", "")
+        try:
+            raw = self._agent_settings.get("planner_max_replan_attempts")
+            if raw is not None:
+                self._max_replan_attempts = max(1, int(raw))
+        except (ValueError, TypeError):
+            pass
         logger.info("Registered — agent_id=%s", self._agent_id)
 
     # ── WebSocket loop ─────────────────────────────────────────────────────────
@@ -667,11 +685,18 @@ class OrchestratorClient:
             )
 
         elif mtype == "settings_push":
-            logger.info("Settings pushed: %d key(s)", len(payload))
-            self._common_settings.update(payload)
-            for k in ("planner_model", "planner_provider"):
-                if k in payload:
-                    self._agent_settings[k] = payload[k]
+            settings = payload.get("settings", {})
+            logger.info("Settings pushed: %d key(s)", len(settings))
+            self._common_settings.update(settings)
+            for k in ("planner_model", "planner_provider", "planner_max_replan_attempts"):
+                if k in settings:
+                    self._agent_settings[k] = settings[k]
+            if "planner_max_replan_attempts" in settings:
+                try:
+                    self._max_replan_attempts = max(1, int(settings["planner_max_replan_attempts"]))
+                    logger.info("Max replan attempts updated → %d", self._max_replan_attempts)
+                except (ValueError, TypeError):
+                    pass
             if self._planner is not None:
                 self._planner.update_settings(self._common_settings, self._agent_settings)
 
@@ -1338,9 +1363,9 @@ class OrchestratorClient:
             )
 
         replan_count = int(workflow.get("replan_count") or 0)
-        if replan_count >= MAX_REPLAN_ATTEMPTS or not self._planner:
+        if replan_count >= self._max_replan_attempts or not self._planner:
             give_up_msg = (
-                f"Re-plan limit reached ({replan_count}/{MAX_REPLAN_ATTEMPTS}). "
+                f"Re-plan limit reached ({replan_count}/{self._max_replan_attempts}). "
                 "Unable to complete the task automatically."
             )
             logger.warning("Workflow %s: %s", task_id[:8], give_up_msg)
@@ -1416,7 +1441,7 @@ class OrchestratorClient:
         })
 
         retry_msg = (
-            f"Revised plan ready ({next_replan_count}/{MAX_REPLAN_ATTEMPTS}) "
+            f"Revised plan ready ({next_replan_count}/{self._max_replan_attempts}) "
             f"— {len(replanned_steps)} step(s). Continuing now…"
         )
         if channel_id:
@@ -1435,7 +1460,7 @@ class OrchestratorClient:
         )
         logger.info(
             "Workflow %s auto-replanned (attempt %d/%d): %d step(s)",
-            task_id[:8], next_replan_count, MAX_REPLAN_ATTEMPTS, len(replanned_steps),
+            task_id[:8], next_replan_count, self._max_replan_attempts, len(replanned_steps),
         )
 
     async def _handle_replan_approval_reply(
@@ -1583,22 +1608,30 @@ class OrchestratorClient:
         answer_format = _clean_text(req.get("answer_format")).lower() or "text"
         choices = req.get("choices") if isinstance(req.get("choices"), list) else []
         choices = [str(c) for c in choices if str(c).strip()]
+        agent_capability = _clean_text(req.get("agent_capability"))
+        agent_task = _clean_text(req.get("agent_task")) or question
 
         channel_id = _clean_text(workflow.get("channel_id"))
         thread_id = _clean_text(workflow.get("thread_id"))
         user_id = _clean_text(workflow.get("user_id"))
         requester_id = _clean_text(workflow.get("requester_id"))
 
-        # First attempt: resolve from Cortex memory context.
+        input_data = step.get("input_data", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+
+        # Resolution priority:
+        # 1. Cortex long-term memory (instant, no network call)
+        # 2. A capable agent (e.g. gmail reader, SMS agent) — automatic, no human needed
+        # 3. Ask the human via Slack (last resort)
+
+        # ── 1. Cortex memory ──────────────────────────────────────────────
         if self._planner:
             try:
                 memory = await self._planner.fetch_memory_context(user_id=user_id)
                 resolved = await self._planner.answer_followup_from_memory(question, memory)
                 if resolved.get("found") and resolved.get("confidence", 0.0) >= 0.65:
                     answer = resolved.get("answer")
-                    input_data = step.get("input_data", {})
-                    if not isinstance(input_data, dict):
-                        input_data = {}
                     patched = self._apply_followup_answer_to_input(
                         input_data, field_name, question_id, answer
                     )
@@ -1625,6 +1658,46 @@ class OrchestratorClient:
             except Exception as exc:
                 logger.warning("Failed to resolve follow-up from Cortex: %s", exc)
 
+        # ── 2. Agent-assisted resolution ──────────────────────────────────
+        if agent_capability:
+            try:
+                agent_answer = await self._resolve_followup_via_agent(
+                    agent_capability, agent_task
+                )
+                if agent_answer:
+                    patched = self._apply_followup_answer_to_input(
+                        input_data, field_name, question_id, agent_answer
+                    )
+                    await asyncio.to_thread(
+                        self._store.update_step_input, task_id, step_index, patched
+                    )
+                    await asyncio.to_thread(
+                        self._store.set_status, task_id, "running", None
+                    )
+                    await self._emit_workflow_event(ws, {
+                        "event": "followup_resolved_by_agent",
+                        "task_id": task_id,
+                        "step_id": step.get("step_id"),
+                        "step_order": step_index + 1,
+                        "question_id": question_id,
+                        "field_name": field_name,
+                        "agent_capability": agent_capability,
+                        "workflow_status": "running",
+                    })
+                    asyncio.create_task(
+                        self._dispatch_step(ws, task_id, step_index),
+                        name=f"followup-agent-retry-{task_id[:8]}-{step_index}",
+                    )
+                    return
+                logger.info(
+                    "Agent %r could not answer — falling back to user", agent_capability
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Agent-assisted followup failed (%s): %s", agent_capability, exc
+                )
+
+        # ── 3. Ask the human ──────────────────────────────────────────────
         if not channel_id:
             await self._handle_workflow_failure(
                 ws=ws,
@@ -2072,6 +2145,83 @@ class OrchestratorClient:
         except (asyncio.TimeoutError, Exception) as exc:
             self._pending_responses.pop(req_id, None)
             logger.warning("Clarification message timed out / failed: %s", exc)
+            return None
+
+    async def _resolve_followup_via_agent(
+        self,
+        agent_capability: str,
+        agent_task: str,
+        timeout_s: float = 60.0,
+    ) -> str | None:
+        """
+        Discover an agent that has *agent_capability*, dispatch *agent_task* to it,
+        and return the text answer.  Returns None if no agent is available, the
+        agent fails, or the call times out.
+
+        This is called before falling back to asking the human via Slack, allowing
+        agents like gmail/SMS readers to satisfy follow-up requests automatically.
+        """
+        agent_id = await self._discover_best(agent_capability)
+        if not agent_id:
+            logger.info(
+                "followup: no agent for capability %r — will ask user", agent_capability
+            )
+            return None
+
+        ws_ref = self._current_ws
+        if ws_ref is None:
+            return None
+
+        req_id = str(uuid.uuid4())
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_responses[req_id] = fut
+
+        await self._ws_send(ws_ref, _envelope(
+            sender_id=self._agent_id,
+            msg_type="task_request",
+            payload={
+                "capability": agent_capability,
+                "input_data": {"task": agent_task},
+                "timeout_ms": int(timeout_s * 1000),
+            },
+            recipient_id=agent_id,
+            msg_id=req_id,
+        ))
+        logger.info(
+            "followup: dispatched to agent %s (cap=%s) corr=%s",
+            agent_id[:8], agent_capability, req_id[:8],
+        )
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+            if not result.get("success"):
+                logger.info(
+                    "followup agent %s returned failure: %s",
+                    agent_capability, result.get("error"),
+                )
+                return None
+            output = result.get("output_data") or {}
+            # Accept any common text-output field name
+            answer = (
+                output.get("result")
+                or output.get("answer")
+                or output.get("code")
+                or output.get("text")
+                or output.get("content")
+                or output.get("summary")
+            )
+            if answer is None and output:
+                answer = str(output)
+            if answer:
+                logger.info(
+                    "followup resolved by agent %s: %r", agent_capability, str(answer)[:80]
+                )
+            return str(answer) if answer else None
+        except (asyncio.TimeoutError, Exception) as exc:
+            self._pending_responses.pop(req_id, None)
+            logger.warning(
+                "followup agent %s timed out / failed: %s", agent_capability, exc
+            )
             return None
 
     # ── Cortex memory helpers ──────────────────────────────────────────────────
