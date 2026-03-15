@@ -1075,6 +1075,20 @@ class OrchestratorClient:
             "workflow_status": "running",
         })
 
+        # ── Notify originating channel with plan summary ───────────────────────
+        if channel_id or user_id:
+            asyncio.create_task(
+                self._send_plan_summary(
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    title=plan.title,
+                    description=plan.description,
+                    steps=steps,
+                ),
+                name=f"plan-summary-{plan.task_id[:8]}",
+            )
+
         # ── Dispatch step 0 (non-blocking) ────────────────────────────────────
         if steps:
             asyncio.create_task(
@@ -1120,6 +1134,17 @@ class OrchestratorClient:
         input_data = _resolve_step_refs(step.get("input_data", {}), outputs)
         if isinstance(input_data, dict):
             input_data = _normalise_step_input(capability, input_data)
+
+        # Propagate reply context so downstream agents can send status updates
+        wf_channel_id = _clean_text(workflow.get("channel_id"))
+        if wf_channel_id or _clean_text(workflow.get("user_id")):
+            if isinstance(input_data, dict):
+                input_data["_reply_context"] = {
+                    "channel_type": _clean_text(workflow.get("source")) or "slack",
+                    "channel_id":   wf_channel_id,
+                    "thread_id":    _clean_text(workflow.get("thread_id")),
+                    "user_id":      _clean_text(workflow.get("user_id")),
+                }
 
         # Discover target agent (cached)
         target_agent_id = step.get("target_agent_id") or await self._discover_best(capability)
@@ -1235,6 +1260,12 @@ class OrchestratorClient:
                 "total_steps":     total,
                 "workflow_status": "running",
             })
+
+            # Notify user of step completion
+            asyncio.create_task(
+                self._send_step_update(workflow, step_index + 1, total, step_name, success=True),
+                name=f"step-notify-{task_id[:8]}-{step_index}",
+            )
 
             next_index = step_index + 1
             if next_index < total:
@@ -2118,6 +2149,67 @@ class OrchestratorClient:
         except Exception as exc:
             logger.warning("Failed to notify avatar agent: %s", exc)
 
+    # ── Plan summary + step status notifications ───────────────────────────────
+
+    async def _send_plan_summary(
+        self,
+        channel_id: str,
+        thread_id: str,
+        user_id: str,
+        title: str,
+        description: str,
+        steps: list[dict],
+    ) -> None:
+        """Send a formatted plan summary back to the originating channel."""
+        if not channel_id and not user_id:
+            return
+        number_emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+        step_lines = []
+        for i, s in enumerate(steps):
+            icon = number_emoji[i] if i < len(number_emoji) else f"{i+1}."
+            name = s.get("name", f"Step {i+1}")
+            desc = s.get("description", "")
+            line = f"  {icon} *{name}*" + (f" — {desc}" if desc else "")
+            step_lines.append(line)
+        text = f"📋 *{title}*\n_{description}_\n\n" + "\n".join(step_lines)
+        await self._send_clarification_message(
+            channel_id=channel_id,
+            thread_ts=thread_id,
+            user_id=user_id,
+            text=text,
+        )
+
+    async def _send_step_update(
+        self,
+        workflow: dict,
+        step_num: int,
+        total: int,
+        step_name: str,
+        success: bool,
+    ) -> None:
+        """Send a per-step status notification to the originating channel."""
+        channel_id = _clean_text(workflow.get("channel_id"))
+        thread_id  = _clean_text(workflow.get("thread_id"))
+        user_id    = _clean_text(workflow.get("user_id"))
+        source     = _clean_text(workflow.get("source"))
+        requester_id = _clean_text(workflow.get("requester_id"))
+
+        icon = "✅" if success else "❌"
+        text = f"{icon} Step {step_num}/{total}: *{step_name}*"
+
+        if channel_id:
+            await self._send_clarification_message(
+                channel_id=channel_id,
+                thread_ts=thread_id,
+                user_id=user_id,
+                text=text,
+            )
+        elif source == "avatar" and requester_id:
+            asyncio.create_task(
+                self._notify_avatar(requester_id, text),
+                name=f"step-notify-avatar-{step_num}",
+            )
+
     # ── Clarification message ──────────────────────────────────────────────────
 
     async def _send_clarification_message(
@@ -2270,6 +2362,21 @@ class OrchestratorClient:
             await self._ws_send(ws, self._msg("workflow_event", payload))
         except Exception as exc:
             logger.warning("Failed to emit workflow_event: %s", exc)
+
+    # ── User notification helper (HTTP) ────────────────────────────────────────
+
+    async def _notify_user(self, reply_context: dict, message: str) -> None:
+        """Send a status message back to the originating user channel via orchestrator notify API."""
+        if not reply_context or not message:
+            return
+        try:
+            await self._http.post(
+                f"{self._base}/api/v1/notify",
+                json={**reply_context, "message": message, "sender_agent_id": self._agent_id},
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.warning("_notify_user failed: %s", exc)
 
     # ── Status update ──────────────────────────────────────────────────────────
 
