@@ -99,6 +99,36 @@ Rules:
 
 _PLAN_SYSTEM_PROMPT: str = _load_plan_system_prompt()
 
+_SESSION_HISTORY_MAX_CHARS: int = 1500  # keep injected history compact
+
+
+def _format_session_history(history: list[dict]) -> str:
+    """
+    Format recent conversation turns into a compact context block for the LLM.
+    *history* is a list of {"sender": str, "text": str} dicts, oldest first.
+    Returns an empty string when history is empty.
+    """
+    if not history:
+        return ""
+    lines: list[str] = ["Recent conversation context (use this to avoid redundant questions and build on prior context):"]
+    for turn in history:
+        sender = str(turn.get("sender", "user")).strip()
+        text   = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+        role = "User" if sender == "user" else "Assistant"
+        # Truncate very long turns
+        if len(text) > 400:
+            text = text[:397] + "…"
+        lines.append(f"[{role}]: {text}")
+    if len(lines) == 1:
+        return ""  # nothing but the header
+    block = "\n".join(lines)
+    # Hard cap to keep total prompt size reasonable
+    if len(block) > _SESSION_HISTORY_MAX_CHARS:
+        block = block[:_SESSION_HISTORY_MAX_CHARS] + "\n[...earlier history truncated]"
+    return "\n" + block + "\n"
+
 
 _CLARIFICATION_SYSTEM_PROMPT = """\
 Assess whether the goal needs clarification before planning. Output JSON only:
@@ -112,6 +142,8 @@ Rules:
 - Max 3 questions. Ask only for genuinely missing info (targets, scope, constraints).
   Do not ask about things that can be inferred or that capabilities make unnecessary.
 - Memory context = confirmed facts. Do not ask about anything already in memory.
+- Session history = this conversation's prior exchanges. Do NOT ask about anything
+  the user already told you in recent messages. Extract facts from prior turns.
 - If the goal asks what you know about the user (e.g. "Do you know my car?"),
   output false — the planner resolves it via memory lookup.
 """
@@ -236,19 +268,39 @@ class TaskPlanner:
             self._vector_search_enabled, self._vector_search_top_k, self._vector_search_multiphase,
         )
 
-    async def _proxy_complete(self, messages: list[dict], system: str, max_tokens: int) -> str:
-        """Send a completion request to the orchestrator LLM proxy and return the response text."""
+    async def _proxy_complete(
+        self,
+        messages: list[dict],
+        system: str,
+        max_tokens: int,
+        segments: list[dict] | None = None,
+    ) -> str:
+        """
+        Send a completion request to the orchestrator LLM proxy and return the response text.
+
+        When *segments* is provided the request uses prompt_segments for cache-aware
+        assembly; *system* and *messages* are ignored in that case.
+        """
         async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(
-                self._proxy_url,
-                headers={"X-Agent-Id": self._agent_id},
-                json={
+            if segments:
+                payload: dict = {
+                    "provider": self._provider,
+                    "model": self._model,
+                    "max_tokens": max_tokens,
+                    "prompt_segments": segments,
+                }
+            else:
+                payload = {
                     "provider": self._provider,
                     "model": self._model,
                     "messages": messages,
                     "system": system,
                     "max_tokens": max_tokens,
-                },
+                }
+            r = await client.post(
+                self._proxy_url,
+                headers={"X-Agent-Id": self._agent_id},
+                json=payload,
             )
             r.raise_for_status()
             data = r.json()
@@ -471,12 +523,26 @@ class TaskPlanner:
         )
         try:
             raw = await self._proxy_complete(
-                messages=[{
-                    "role": "user",
-                    "content": f"Goal: {goal}\n{memory_section}",
-                }],
-                system=_DECOMPOSE_SYSTEM_PROMPT,
+                messages=[],
+                system="",
                 max_tokens=512,
+                segments=[
+                    {
+                        "name": "system_prompt",
+                        "type": "system",
+                        "content": _DECOMPOSE_SYSTEM_PROMPT,
+                        "cacheable": True,
+                    },
+                    {
+                        "name": "request",
+                        "type": "messages",
+                        "content": [{
+                            "role": "user",
+                            "content": f"Goal: {goal}\n{memory_section}",
+                        }],
+                        "cacheable": False,
+                    },
+                ],
             )
             result = self._extract_json(raw)
             phases = result.get("phases") or []
@@ -525,6 +591,7 @@ class TaskPlanner:
         goal: str,
         agents: list[dict],
         memory_context: str = "",
+        session_history: list[dict] | None = None,
     ) -> dict:
         """
         Quick LLM call (max_tokens=512) to check if goal needs clarification.
@@ -533,6 +600,8 @@ class TaskPlanner:
 
         memory_context: pre-fetched Cortex content; answers already present there
         are treated as known and suppress the corresponding clarification questions.
+        session_history: recent conversation turns — answers already given in
+        this session also suppress redundant clarification questions.
         """
         caps_text = self._format_capabilities(agents, goal=goal, compact=True)
         compact_memory = self._compact_memory_context(memory_context)
@@ -541,18 +610,34 @@ class TaskPlanner:
             f"do NOT ask about anything already answered here):\n{compact_memory}\n"
             if compact_memory else ""
         )
+        session_section = _format_session_history(session_history or [])
         try:
             raw = await self._proxy_complete(
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Goal: {goal}\n"
-                        f"{memory_section}\n"
-                        f"Available capabilities:\n{caps_text}"
-                    ),
-                }],
-                system=_CLARIFICATION_SYSTEM_PROMPT,
+                messages=[],
+                system="",
                 max_tokens=512,
+                segments=[
+                    {
+                        "name": "system_prompt",
+                        "type": "system",
+                        "content": _CLARIFICATION_SYSTEM_PROMPT,
+                        "cacheable": True,
+                    },
+                    {
+                        "name": "request",
+                        "type": "messages",
+                        "content": [{
+                            "role": "user",
+                            "content": (
+                                f"Goal: {goal}\n"
+                                f"{memory_section}"
+                                f"{session_section}\n"
+                                f"Available capabilities:\n{caps_text}"
+                            ),
+                        }],
+                        "cacheable": False,
+                    },
+                ],
             )
             logger.debug("Clarification check response: %s", raw[:300])
             return self._extract_json(raw)
@@ -574,15 +659,29 @@ class TaskPlanner:
             return {"found": False, "answer": "", "confidence": 0.0}
         try:
             raw = await self._proxy_complete(
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Question:\n{question}\n\n"
-                        f"Memory context:\n{compact_memory}"
-                    ),
-                }],
-                system=_FOLLOWUP_MEMORY_SYSTEM_PROMPT,
+                messages=[],
+                system="",
                 max_tokens=256,
+                segments=[
+                    {
+                        "name": "system_prompt",
+                        "type": "system",
+                        "content": _FOLLOWUP_MEMORY_SYSTEM_PROMPT,
+                        "cacheable": True,
+                    },
+                    {
+                        "name": "request",
+                        "type": "messages",
+                        "content": [{
+                            "role": "user",
+                            "content": (
+                                f"Question:\n{question}\n\n"
+                                f"Memory context:\n{compact_memory}"
+                            ),
+                        }],
+                        "cacheable": False,
+                    },
+                ],
             )
             parsed = self._extract_json(raw)
             found = bool(parsed.get("found"))
@@ -914,6 +1013,7 @@ class TaskPlanner:
         memory_context: str = "",
         clarification_message: str = "",
         clarification_answers: str = "",
+        session_history: list[dict] | None = None,
     ) -> WorkflowPlan:
         """
         Generate a WorkflowPlan for *goal* using a single Anthropic API call.
@@ -990,13 +1090,15 @@ class TaskPlanner:
             f"\nPersonalisation context from Cortex memory:\n{compact_memory}\n"
             if compact_memory else ""
         )
+        session_section = _format_session_history(session_history or [])
 
+        # Per-request user message: goal, memory, session, reply context (dynamic)
         user_msg = (
             f"CURRENT_UTC: {self._iso_utc(now_utc)}\n\n"
             f"Request context:\n{reply_context}\n"
-            f"{memory_section}\n"
+            f"{memory_section}"
+            f"{session_section}\n"
             f"Goal: {goal}\n\n"
-            f"Available agent capabilities:\n{caps_text}\n\n"
             "Create a workflow plan to accomplish this goal. "
             "Include a clear goal for each step. "
             "Remember: the FINAL step must always send a completion response "
@@ -1007,31 +1109,46 @@ class TaskPlanner:
 
         # ── Single or multi-turn LLM call ────────────────────────────────────
         if clarification_message and clarification_answers:
-            # Full multi-turn: planning context → prior questions → user answers.
-            # The LLM sees the exact back-and-forth so it can map each answer to
-            # the question that prompted it.
-            messages = [
+            conv_messages = [
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": clarification_message},
                 {"role": "user", "content": clarification_answers},
             ]
             logger.info("Planning with multi-turn conversation history (3 turns)")
         elif clarification_answers:
-            # Fallback: we have the user's answers but no stored question text.
-            # Inject the answers directly into the planning context so they are
-            # never silently dropped regardless of what happened to the stored msg.
             user_msg += (
                 f"\n\nThe user provided these answers to clarification questions:\n"
                 f"{clarification_answers}"
             )
-            messages = [{"role": "user", "content": user_msg}]
+            conv_messages = [{"role": "user", "content": user_msg}]
             logger.info("Planning with clarification answers injected into context")
         else:
-            messages = [{"role": "user", "content": user_msg}]
+            conv_messages = [{"role": "user", "content": user_msg}]
+
         raw_text: str = await self._proxy_complete(
-            messages=messages,
-            system=self._plan_system_prompt,
+            messages=[],
+            system="",
             max_tokens=self._max_tokens,
+            segments=[
+                {
+                    "name": "system_prompt",
+                    "type": "system",
+                    "content": self._plan_system_prompt,
+                    "cacheable": True,
+                },
+                {
+                    "name": "capabilities",
+                    "type": "context",
+                    "content": f"Available agent capabilities:\n{caps_text}",
+                    "cacheable": True,
+                },
+                {
+                    "name": "conversation",
+                    "type": "messages",
+                    "content": conv_messages,
+                    "cacheable": False,
+                },
+            ],
         )
         logger.debug("LLM response: %s", raw_text[:500])
 

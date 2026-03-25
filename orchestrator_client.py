@@ -805,6 +805,9 @@ class OrchestratorClient:
         persona = _clean_text(input_data.get("persona"))
         summary_format = _clean_text(input_data.get("summary_format"))
         source = _clean_text(input_data.get("source"))
+        session_history = input_data.get("session_history") or []
+        if not isinstance(session_history, list):
+            session_history = []
         payload = input_data.get("payload")
         if isinstance(payload, dict):
             if not channel_id:
@@ -930,7 +933,8 @@ class OrchestratorClient:
             try:
                 agents = await self._planner.discover_capabilities()
                 clarity = await self._planner.check_needs_clarification(
-                    goal, agents, memory_context=memory_context
+                    goal, agents, memory_context=memory_context,
+                    session_history=session_history,
                 )
                 if clarity.get("needs_clarification") and clarity.get("questions"):
                     questions: list[str] = clarity["questions"][:3]
@@ -981,9 +985,10 @@ class OrchestratorClient:
                 persona=persona,
                 summary_format=summary_format,
                 source=source,
-                memory_context=memory_context,        # reuse already-fetched context
+                memory_context=memory_context,              # reuse already-fetched context
                 clarification_message=clarification_message,  # "" for fresh requests
                 clarification_answers=clarification_answers,  # "" for fresh requests
+                session_history=session_history,
             )
         except Exception as exc:
             logger.error("Planning failed: %s", exc)
@@ -1319,6 +1324,10 @@ class OrchestratorClient:
             # Step failed — persist and abort
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
             err_msg = error or "Unknown error"
+            # Extract replan context if the browser agent provided one (LLM retry exhausted)
+            replan_context: dict | None = None
+            if isinstance(output, dict) and output.get("replan_context"):
+                replan_context = output["replan_context"]
             await self._handle_workflow_failure(
                 ws=ws,
                 task_id=task_id,
@@ -1327,6 +1336,7 @@ class OrchestratorClient:
                 step=step,
                 err_msg=err_msg,
                 duration_ms=duration_ms,
+                replan_context=replan_context,
             )
 
     async def _handle_workflow_failure(
@@ -1338,6 +1348,7 @@ class OrchestratorClient:
         step: dict,
         err_msg: str,
         duration_ms: float,
+        replan_context: dict | None = None,
     ) -> None:
         """Emit failure events, notify user, and prepare a re-plan approval request."""
         steps = workflow.get("steps", [])
@@ -1388,12 +1399,21 @@ class OrchestratorClient:
         )
 
         # Notify the source channel of the failure
+        _is_llm_retry = replan_context and replan_context.get("failure_type") == "llm_unavailable"
+        _agent_label  = (replan_context or {}).get("agent_name", step_name)
         if channel_id:
+            if _is_llm_retry:
+                notify_text = (
+                    f"⚠️ LLM became unavailable for *{_agent_label}* at step {step_index + 1}. "
+                    "Assessing whether to retry or find an alternative…"
+                )
+            else:
+                notify_text = f"Workflow hit an error — {failure_summary}. Trying a revised plan…"
             await self._send_clarification_message(
                 channel_id=channel_id,
                 thread_ts=thread_id,
                 user_id=user_id,
-                text=f"Workflow hit an error — {failure_summary}. Trying a revised plan…",
+                text=notify_text,
             )
         elif source == "avatar" and requester_id:
             asyncio.create_task(
@@ -1422,14 +1442,52 @@ class OrchestratorClient:
                 )
             return
 
-        # Auto-replan without user approval
-        failure_context_goal = (
-            f"{goal}\n\n"
-            f"Previous attempt failed at step {step_index + 1}/{total} "
-            f"({step_name}, capability={capability}).\n"
-            f"Error: {err_msg}\n"
-            "Create an alternative plan that avoids the failed path and still achieves the goal."
-        )
+        # Auto-replan without user approval — include agent state context when available
+        if replan_context:
+            rc              = replan_context
+            failure_type    = rc.get("failure_type", "unknown")
+            agent_name      = rc.get("agent_name", capability)
+            retry_attempts  = rc.get("retry_attempts", 0)
+            last_error      = rc.get("last_error", err_msg)
+            retry_possible  = rc.get("retry_possible", False)
+            progress_summary = rc.get("progress_summary", "")
+            steps_done      = rc.get("completed_steps", [])
+            resume_ctx      = rc.get("resume_context", {})   # agent-specific resume hints
+
+            steps_summary = (
+                "\n".join(f"  - {s}" for s in steps_done[-10:])
+                if steps_done else "  (none recorded)"
+            )
+            # Format any agent-specific resume hints (e.g. current_url for browser-agent)
+            resume_lines = "\n".join(
+                f"  {k}: {v}" for k, v in resume_ctx.items() if v
+            )
+            resume_section = (
+                f"Agent resume context (include relevant fields in retry input_data):\n{resume_lines}\n"
+                if resume_lines else ""
+            )
+
+            failure_context_goal = (
+                f"{goal}\n\n"
+                f"REPLAN CONTEXT — step {step_index + 1}/{total} "
+                f"({step_name}, capability={capability}, agent={agent_name}):\n"
+                f"  failure_type:    {failure_type}\n"
+                f"  retry_attempts:  {retry_attempts}\n"
+                f"  last_error:      {last_error}\n"
+                f"  retry_possible:  {retry_possible}\n"
+                + (f"  progress:        {progress_summary}\n" if progress_summary else "")
+                + f"Steps completed before failure:\n{steps_summary}\n"
+                + (f"{resume_section}" if resume_section else "")
+                + "\nREPLAN INSTRUCTIONS: see system rules."
+            )
+        else:
+            failure_context_goal = (
+                f"{goal}\n\n"
+                f"Previous attempt failed at step {step_index + 1}/{total} "
+                f"({step_name}, capability={capability}).\n"
+                f"Error: {err_msg}\n"
+                "Create an alternative plan that avoids the failed path and still achieves the goal."
+            )
         next_replan_count = replan_count + 1
         try:
             replan = await self._planner.plan(
@@ -2101,11 +2159,7 @@ class OrchestratorClient:
             return
 
         # Build result text from the last successful step output
-        outputs: list = []
-        try:
-            outputs = json.loads(workflow.get("outputs_json") or "[]") or []
-        except Exception:
-            pass
+        outputs: list = workflow.get("outputs") or []
 
         result_text = ""
         for output in reversed(outputs):
@@ -2220,10 +2274,23 @@ class OrchestratorClient:
         user_id: str = "",
     ) -> Optional[str]:
         """
-        Send a Slack message directly (outside any workflow step).
-        Uses the existing _pending_responses mechanism to await the reply ts.
-        Returns Slack message ts, or None on failure.
+        Send a message directly (outside any workflow step).
+        Routes to the built-in chat store when channel_id starts with "chat:",
+        otherwise forwards to the slack-connector via WS.
+        Returns message ts/id, or None on failure.
         """
+        # ── Built-in chat channel ──────────────────────────────────────────────
+        if channel_id.startswith("chat:"):
+            reply_ctx = {
+                "channel_type": "chat",
+                "channel_id":   channel_id[5:] or "general",  # strip "chat:" prefix
+                "thread_id":    thread_ts or "",
+                "user_id":      user_id or "",
+            }
+            await self._notify_user(reply_ctx, text)
+            return thread_ts or channel_id
+
+        # ── Slack connector ────────────────────────────────────────────────────
         agent_id = await self._discover_best("send_slack_message")
         if not agent_id:
             logger.warning("No send_slack_message agent available for clarification")
