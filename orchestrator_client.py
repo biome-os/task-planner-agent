@@ -38,8 +38,10 @@ import httpx
 import websockets
 import websockets.exceptions
 
+from emergent_runner import EmergentStepRunner
 from formatters import render_formatter
 from models import WorkflowPlan
+from plan_tracker import PlanTracker
 from planner import TaskPlanner
 from workflow_store import WorkflowStore
 
@@ -445,6 +447,28 @@ REGISTRATION_PAYLOAD: dict = {
             ),
             "default": 3,
         },
+        {
+            "key": "planner_hybrid_execution",
+            "label": "Hybrid Execution",
+            "type": "boolean",
+            "required": False,
+            "description": (
+                "When enabled, low-confidence steps (execution_mode=emergent) are "
+                "handled by an LLM tool loop instead of strict direct dispatch. "
+                "High-confidence steps are unaffected. Default: false."
+            ),
+            "default": False,
+        },
+        {
+            "key": "planner_emergent_max_turns",
+            "label": "Emergent Max Turns",
+            "type": "integer",
+            "required": False,
+            "description": (
+                "Maximum LLM+capability iterations per emergent step. Default: 6."
+            ),
+            "default": 6,
+        },
     ],
 }
 
@@ -520,6 +544,12 @@ class OrchestratorClient:
         self._agent_settings: dict = {}
         self._registered_prompt: str = ""
         self._max_replan_attempts: int = MAX_REPLAN_ATTEMPTS
+        self._hybrid_execution: bool = False
+        self._emergent_max_turns: int = 6
+        self._plan_tracker: PlanTracker = PlanTracker()
+
+        # Futures used by emergent runner to await task_response callbacks
+        self._emergent_pending: dict[str, asyncio.Future] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -559,6 +589,7 @@ class OrchestratorClient:
                 self._max_replan_attempts = max(1, int(raw))
         except (ValueError, TypeError):
             pass
+        self._apply_hybrid_settings(self._agent_settings)
         logger.info("Registered — agent_id=%s", self._agent_id)
 
     # ── WebSocket loop ─────────────────────────────────────────────────────────
@@ -670,6 +701,13 @@ class OrchestratorClient:
                 )
                 return
 
+            # ── Emergent tool-loop callback path ───────────────────────────
+            if corr in self._emergent_pending:
+                fut = self._emergent_pending.pop(corr)
+                if not fut.done():
+                    fut.set_result(payload)
+                return
+
             # ── Normal pending-response path ───────────────────────────────
             if corr in self._pending_responses:
                 fut = self._pending_responses.pop(corr)
@@ -688,7 +726,12 @@ class OrchestratorClient:
             settings = payload.get("settings", {})
             logger.info("Settings pushed: %d key(s)", len(settings))
             self._common_settings.update(settings)
-            for k in ("planner_model", "planner_provider", "planner_max_replan_attempts"):
+            for k in (
+                "planner_model", "planner_provider",
+                "planner_max_replan_attempts",
+                "planner_hybrid_execution",
+                "planner_emergent_max_turns",
+            ):
                 if k in settings:
                     self._agent_settings[k] = settings[k]
             if "planner_max_replan_attempts" in settings:
@@ -697,6 +740,7 @@ class OrchestratorClient:
                     logger.info("Max replan attempts updated → %d", self._max_replan_attempts)
                 except (ValueError, TypeError):
                     pass
+            self._apply_hybrid_settings(settings)
             if self._planner is not None:
                 self._planner.update_settings(self._common_settings, self._agent_settings)
 
@@ -1115,6 +1159,9 @@ class OrchestratorClient:
         """
         Look up the workflow, resolve input refs, find the best agent,
         send task_request, and save the correlation so the callback is routed here.
+
+        When hybrid execution is enabled and the step has execution_mode="emergent",
+        delegates to _dispatch_emergent_step instead.
         """
         workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
         if not workflow:
@@ -1129,6 +1176,19 @@ class OrchestratorClient:
             return
 
         step       = steps[step_index]
+
+        # Route emergent steps to the tool-loop runner when hybrid mode is active
+        if self._hybrid_execution and step.get("execution_mode") == "emergent":
+            logger.info(
+                "Workflow %s step %d/%d: routing to emergent runner (confidence=%.2f)",
+                task_id[:8], step_index + 1, len(steps),
+                float(step.get("confidence", 0.0)),
+            )
+            asyncio.create_task(
+                self._dispatch_emergent_step(ws, task_id, step_index),
+                name=f"emergent-{task_id[:8]}-{step_index}",
+            )
+            return
         step_id    = step["step_id"]
         step_name  = step["name"]
         step_goal  = step.get("goal", step.get("description", ""))
@@ -1151,11 +1211,51 @@ class OrchestratorClient:
                     "user_id":      _clean_text(workflow.get("user_id")),
                 }
 
+        # Pre-flight: catch the common mistake where the planner emits an agent name
+        # (e.g. "code-execution-agent") instead of a capability name (e.g. "execute_code").
+        # Agent names are kebab-case strings ending in "-agent" or "-service"; capability
+        # names use snake_case.  Warn early so the replan context is explicit.
+        if re.search(r'(?:^|-)agent$|-service$', capability) and '_' not in capability:
+            logger.warning(
+                "Workflow %s step %d: capability '%s' looks like an agent name, not a "
+                "capability identifier. The planner should use the snake_case capability "
+                "name (e.g. 'execute_code'), not the agent name (e.g. 'code-execution-agent').",
+                task_id[:8], step_index + 1, capability,
+            )
+
         # Discover target agent (cached)
         target_agent_id = step.get("target_agent_id") or await self._discover_best(capability)
         if not target_agent_id:
-            err = f"No available agent for capability '{capability}'"
+            # Provide a more actionable error when the capability looks like an agent name
+            if re.search(r'(?:^|-)agent$|-service$', capability) and '_' not in capability:
+                err = (
+                    f"No capability named '{capability}' is registered. "
+                    f"'{capability}' is an agent name, not a capability name — "
+                    f"use the snake_case capability identifier instead "
+                    f"(e.g. 'execute_code' not 'code-execution-agent')."
+                )
+            else:
+                err = f"No available agent for capability '{capability}'"
             logger.warning("Workflow %s step %d: %s", task_id[:8], step_index + 1, err)
+
+            # If hybrid execution is enabled, let the emergent runner discover a
+            # suitable capability dynamically instead of immediately failing.
+            if self._hybrid_execution and not step.get("_emergent_fallback"):
+                logger.info(
+                    "Workflow %s step %d/%d: no agent for '%s' — "
+                    "falling back to emergent runner",
+                    task_id[:8], step_index + 1, total, capability,
+                )
+                await asyncio.to_thread(
+                    self._store.patch_step, task_id, step_index,
+                    {"_emergent_fallback": True, "execution_mode": "emergent"},
+                )
+                asyncio.create_task(
+                    self._dispatch_emergent_step(ws, task_id, step_index),
+                    name=f"emergent-fallback-{task_id[:8]}-{step_index}",
+                )
+                return
+
             await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
             await self._handle_workflow_failure(
                 ws=ws,
@@ -1170,16 +1270,18 @@ class OrchestratorClient:
 
         # Emit step_started
         await self._emit_workflow_event(ws, {
-            "event":          "step_started",
-            "task_id":        task_id,
-            "step_id":        step_id,
-            "step_order":     step_index + 1,
-            "step_name":      step_name,
-            "step_desc":      step.get("description", ""),
-            "step_goal":      step_goal,
-            "capability":     capability,
-            "total_steps":    total,
+            "event":           "step_started",
+            "task_id":         task_id,
+            "step_id":         step_id,
+            "step_order":      step_index + 1,
+            "step_name":       step_name,
+            "step_desc":       step.get("description", ""),
+            "step_goal":       step_goal,
+            "capability":      capability,
+            "total_steps":     total,
             "workflow_status": "running",
+            "execution_mode":  step.get("execution_mode", "strict"),
+            "confidence":      step.get("confidence", 1.0),
         })
 
         # Build correlation and save before sending (avoids race if response arrives fast)
@@ -1321,13 +1423,38 @@ class OrchestratorClient:
                 )
 
         else:
-            # Step failed — persist and abort
-            await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
+            # Step failed
             err_msg = error or "Unknown error"
             # Extract replan context if the browser agent provided one (LLM retry exhausted)
             replan_context: dict | None = None
             if isinstance(output, dict) and output.get("replan_context"):
                 replan_context = output["replan_context"]
+
+            # If hybrid execution is enabled and this was a planned (strict) step that
+            # hasn't already been retried via emergent, fall back to the emergent runner
+            # before escalating to a full replan.
+            if (
+                self._hybrid_execution
+                and step.get("execution_mode", "strict") != "emergent"
+                and not step.get("_emergent_fallback")
+            ):
+                logger.info(
+                    "Workflow %s step %d/%d: planned step failed (%s) — "
+                    "falling back to emergent runner",
+                    task_id[:8], step_index + 1, total, err_msg,
+                )
+                await asyncio.to_thread(
+                    self._store.patch_step, task_id, step_index,
+                    {"_emergent_fallback": True, "execution_mode": "emergent"},
+                )
+                asyncio.create_task(
+                    self._dispatch_emergent_step(ws, task_id, step_index),
+                    name=f"emergent-fallback-{task_id[:8]}-{step_index}",
+                )
+                return
+
+            # No emergent fallback available — persist failure and replan
+            await asyncio.to_thread(self._store.advance_step, task_id, step_index, None)
             await self._handle_workflow_failure(
                 ws=ws,
                 task_id=task_id,
@@ -2140,6 +2267,231 @@ class OrchestratorClient:
         except Exception as exc:
             logger.error("Discovery request failed: %s", exc)
         return None
+
+    # ── Hybrid execution helpers ───────────────────────────────────────────────
+
+    def _apply_hybrid_settings(self, settings: dict) -> None:
+        """Parse and apply planner_hybrid_execution / planner_emergent_max_turns."""
+        if "planner_hybrid_execution" in settings:
+            raw = str(settings["planner_hybrid_execution"]).lower().strip()
+            self._hybrid_execution = raw in ("true", "1", "yes")
+            logger.info("Hybrid execution → %s", self._hybrid_execution)
+        if "planner_emergent_max_turns" in settings:
+            try:
+                self._emergent_max_turns = max(1, int(settings["planner_emergent_max_turns"]))
+                logger.info("Emergent max turns → %d", self._emergent_max_turns)
+            except (ValueError, TypeError):
+                pass
+
+    def _make_emergent_runner(self) -> EmergentStepRunner:
+        """Build an EmergentStepRunner wired to this client's infrastructure."""
+        planner = self._planner
+        return EmergentStepRunner(
+            proxy_url=f"{self._base}/api/v1/llm/complete",
+            agent_id=self._agent_id,
+            model=planner._model if planner else "claude-haiku-4-5-20251001",
+            provider=planner._provider if planner else "anthropic",
+            discover_fn=self._discover_best,
+            send_task_fn=self._emergent_send_task,
+            list_capabilities_fn=self._list_capabilities_for_emergent,
+            max_turns=self._emergent_max_turns,
+        )
+
+    async def _list_capabilities_for_emergent(self) -> list[dict]:
+        """Fetch live capability list for the emergent runner's tool catalogue."""
+        _HIDDEN = {"task-planner-agent", "task-executor-agent", "avatar-agent"}
+        try:
+            resp = await self._http.get(f"{self._base}/api/v1/agents")
+            if resp.status_code == 200:
+                agents = resp.json().get("agents", [])
+                caps: list[dict] = []
+                for agent in agents:
+                    if agent.get("name") in _HIDDEN:
+                        continue
+                    for cap in agent.get("capabilities", []):
+                        caps.append(cap)
+                return caps
+        except Exception as exc:
+            logger.debug("list_capabilities_for_emergent failed: %s", exc)
+        return []
+
+    async def _emergent_send_task(
+        self,
+        target_agent_id: str,
+        capability: str,
+        input_data: dict,
+    ) -> dict:
+        """
+        Send a task_request to *target_agent_id* and await its task_response.
+        Used exclusively by EmergentStepRunner tool loop calls.
+        """
+        ws = self._current_ws
+        if ws is None:
+            raise RuntimeError("WebSocket not connected")
+
+        req_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._emergent_pending[req_id] = fut
+
+        try:
+            await self._ws_send(ws, _envelope(
+                sender_id=self._agent_id,
+                msg_type="task_request",
+                payload={
+                    "capability": capability,
+                    "input_data": input_data,
+                    "timeout_ms": 120_000,
+                },
+                recipient_id=target_agent_id,
+                msg_id=req_id,
+            ))
+            result_payload = await asyncio.wait_for(fut, timeout=130.0)
+            output = result_payload.get("output_data") or {}
+            if not result_payload.get("success"):
+                output["error"] = result_payload.get("error", "unknown error")
+            return output
+        finally:
+            self._emergent_pending.pop(req_id, None)
+
+    async def _dispatch_emergent_step(
+        self,
+        ws,
+        task_id: str,
+        step_index: int,
+    ) -> None:
+        """
+        Run a single workflow step using the LLM tool loop (EmergentStepRunner).
+        On success, advance workflow and dispatch next step.
+        On failure/bad output, fall back to _handle_workflow_failure for replan.
+        """
+        workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
+        if not workflow:
+            logger.error("dispatch_emergent_step: workflow %s not found", task_id)
+            return
+
+        steps   = workflow["steps"]
+        outputs = workflow["outputs"]
+
+        if step_index >= len(steps):
+            logger.error("dispatch_emergent_step: step %d out of range for %s", step_index, task_id)
+            return
+
+        step       = steps[step_index]
+        step_id    = step["step_id"]
+        step_name  = step["name"]
+        step_goal  = step.get("goal", step.get("description", ""))
+        capability = step["capability"]
+        total      = len(steps)
+
+        hint_input = _resolve_step_refs(step.get("input_data", {}), outputs)
+        if not isinstance(hint_input, dict):
+            hint_input = {}
+
+        # Emit step_started
+        await self._emit_workflow_event(ws, {
+            "event":           "step_started",
+            "task_id":         task_id,
+            "step_id":         step_id,
+            "step_order":      step_index + 1,
+            "step_name":       step_name,
+            "step_desc":       step.get("description", ""),
+            "step_goal":       step_goal,
+            "capability":      capability,
+            "total_steps":     total,
+            "workflow_status": "running",
+            "execution_mode":  "emergent",
+        })
+
+        t0 = asyncio.get_event_loop().time()
+        runner = self._make_emergent_runner()
+        output: Optional[dict] = None
+        err_msg: str = ""
+
+        try:
+            output = await runner.run(
+                step_name=step_name,
+                step_goal=step_goal,
+                hint_input=hint_input,
+                prior_outputs=outputs,
+            )
+        except Exception as exc:
+            err_msg = str(exc)
+            logger.error(
+                "EmergentRunner failed for workflow %s step %d: %s",
+                task_id[:8], step_index + 1, exc,
+            )
+
+        duration_ms = (asyncio.get_event_loop().time() - t0) * 1000
+
+        # Validate output with PlanTracker
+        decision, reason = self._plan_tracker.validate(step, output)
+        logger.info(
+            "PlanTracker decision for workflow %s step %d: %s — %s",
+            task_id[:8], step_index + 1, decision, reason,
+        )
+
+        if decision == "continue":
+            await asyncio.to_thread(self._store.advance_step, task_id, step_index, output)
+            completed = step_index + 1
+
+            await self._emit_workflow_event(ws, {
+                "event":           "step_completed",
+                "task_id":         task_id,
+                "step_id":         step_id,
+                "step_order":      step_index + 1,
+                "step_name":       step_name,
+                "capability":      capability,
+                "output_data":     output,
+                "duration_ms":     duration_ms,
+                "steps_completed": completed,
+                "total_steps":     total,
+                "workflow_status": "running",
+                "execution_mode":  "emergent",
+            })
+
+            asyncio.create_task(
+                self._send_step_update(workflow, step_index + 1, total, step_name, success=True),
+                name=f"step-notify-{task_id[:8]}-{step_index}",
+            )
+
+            next_index = step_index + 1
+            if next_index < total:
+                logger.info("Workflow %s: emergent step %d/%d done → dispatching step %d",
+                            task_id[:8], step_index + 1, total, next_index + 1)
+                asyncio.create_task(
+                    self._dispatch_step(ws, task_id, next_index),
+                    name=f"step-{task_id[:8]}-{next_index}",
+                )
+            else:
+                await asyncio.to_thread(self._store.set_status, task_id, "completed")
+                logger.info("Workflow %s completed (emergent final step)", task_id[:8])
+                await self._emit_workflow_event(ws, {
+                    "event":           "workflow_completed",
+                    "task_id":         task_id,
+                    "steps_completed": total,
+                    "steps_failed":    0,
+                    "total_steps":     total,
+                    "workflow_status": "completed",
+                })
+                updated_workflow = await asyncio.to_thread(self._store.get_workflow, task_id)
+                asyncio.create_task(
+                    self._notify_source_of_completion(ws, task_id, updated_workflow or workflow),
+                    name=f"notify-complete-{task_id[:8]}",
+                )
+
+        elif decision in ("local_replan", "escalate"):
+            replan_context = PlanTracker.replan_context(step, step_index, output, reason)
+            await self._handle_workflow_failure(
+                ws=ws,
+                task_id=task_id,
+                workflow=workflow,
+                step_index=step_index,
+                step=step,
+                err_msg=err_msg or reason,
+                duration_ms=duration_ms,
+                replan_context=replan_context,
+            )
 
     # ── Source completion notification ─────────────────────────────────────────
 

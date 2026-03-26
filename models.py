@@ -26,6 +26,8 @@ class WorkflowStep:
     input_data: dict[str, Any]
     depends_on: list[str] = field(default_factory=list)
     target_agent_id: Optional[str] = None
+    confidence: float = 1.0          # planner confidence in this step (0.0-1.0)
+    execution_mode: str = "strict"   # "strict" | "emergent"
 
     @classmethod
     def create(
@@ -38,6 +40,8 @@ class WorkflowStep:
         input_data: dict[str, Any],
         depends_on: Optional[list[str]] = None,
         target_agent_id: Optional[str] = None,
+        confidence: float = 1.0,
+        execution_mode: str = "strict",
     ) -> "WorkflowStep":
         return cls(
             step_id=str(uuid.uuid4()),
@@ -49,6 +53,8 @@ class WorkflowStep:
             input_data=input_data,
             depends_on=depends_on or [],
             target_agent_id=target_agent_id,
+            confidence=confidence,
+            execution_mode=execution_mode,
         )
 
     def to_dict(self) -> dict:
@@ -62,6 +68,8 @@ class WorkflowStep:
             "input_data": self.input_data,
             "depends_on": self.depends_on,
             "target_agent_id": self.target_agent_id,
+            "confidence": self.confidence,
+            "execution_mode": self.execution_mode,
         }
 
 

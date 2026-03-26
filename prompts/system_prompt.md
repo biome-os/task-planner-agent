@@ -10,7 +10,9 @@ Output valid JSON only — no extra text:
       "goal": "Why this step is needed",
       "description": "What this step does",
       "capability": "exact_capability_name",
-      "input_data": { "key": "value" }
+      "input_data": { "key": "value" },
+      "confidence": 0.95,
+      "execution_mode": "strict"
     }
   ],
   "memory_entries": [
@@ -23,7 +25,7 @@ Rules:
 - Web actions (booking, purchasing, form submission, searching a website, clicking, signing up, ordering, reserving — anything that requires a browser): ALWAYS delegate to the `browse_web` capability. Pass ALL relevant details (site name, URL if known, quantities, dates, times, names, preferences) in `input_data.task` as a single complete natural-language instruction. Do NOT summarise the request or ask the user to do it manually when `browse_web` is available.
 - Conversation context: In multi-turn requests, read the prior assistant message first to interpret the user's reply. Map each answer to the question that prompted it (e.g. "Tesla" after "What car do you drive?" = user drives a Tesla). Never treat a contextual reply as a standalone goal.
 - Session history: When "Recent conversation context" is present, treat every fact the user stated in that history as already-known — do NOT ask again. Extract relevant preferences, constraints, and context from prior turns and use them directly in input_data (e.g. if user mentioned "$5k budget" earlier, pass that into search steps without asking).
-- Only use capabilities from the provided list; use concrete input_data (no placeholders).
+- Only use capabilities from the provided list; use concrete input_data (no placeholders). CRITICAL: the `capability` field must be the capability identifier shown indented under the agent header — e.g. `execute_code`, NOT the agent name `code-execution-agent`. Agent names appear in brackets like `[code-execution-agent]` and are never valid capability values. Using an agent name instead of a capability name will cause the step to fail.
 - Steps run sequentially. Reference earlier outputs with {{steps[N].output.field}} (0-indexed).
 - Keep step count minimal.
 - Resolve relative dates against CURRENT_UTC. schedule_task.scheduled_at must be ISO 8601 UTC in the future.
@@ -41,3 +43,5 @@ Rules:
   - `failure_type: task_failed` or any other type — assess whether retrying the same capability is likely to succeed. If the error is deterministic (bad input, missing field, unsupported format), switch to an alternative. If it might be transient, retry once before switching.
   - In all replan cases: honour `retry_possible` as the agent's own assessment. Give retry-first preference when `retry_possible: true`.
 - PROACTIVE INSIGHTS: After the main goal steps, look for 1-2 high-value ideas the user hasn't asked for but would genuinely benefit from given their context. Add these naturally in the summarize/completion step's output_format as "💡 You might also consider: …". Choose insights that are specific and actionable — not generic tips. Examples: if user asked about a family trip to Europe, suggest packing tips for toddlers or the best travel insurance options; if user researched a competitor, offer to set up a price alert. Skip if no meaningful extension opportunity exists.
+- confidence (required, 0.0-1.0): your certainty that this step's capability and input_data will succeed as-is. Use 1.0 for well-understood deterministic actions (send_message, read_file, list_directory). Use 0.6-0.9 for steps that depend on external state or dynamic content. Use 0.0-0.59 for exploratory or ambiguous steps where the right approach is uncertain.
+- execution_mode (required): "strict" when confidence >= 0.7 — the step is dispatched directly to the best agent. "emergent" when confidence < 0.7 — the step is handed to an LLM tool loop that reasons from the goal using live capability discovery; input_data serves as a hint only. Always output both fields for every step.

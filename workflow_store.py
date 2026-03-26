@@ -286,6 +286,25 @@ class WorkflowStore:
         )
         self._conn.commit()
 
+    def patch_step(self, task_id: str, step_index: int, fields: dict) -> None:
+        """Merge *fields* into a single step without advancing the workflow cursor."""
+        row = self._conn.execute(
+            "SELECT steps_json FROM workflows WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not row:
+            return
+        steps = json.loads(row["steps_json"] or "[]")
+        if not isinstance(steps, list) or step_index < 0 or step_index >= len(steps):
+            return
+        if not isinstance(steps[step_index], dict):
+            return
+        steps[step_index].update(fields)
+        self._conn.execute(
+            "UPDATE workflows SET steps_json=?, updated_at=? WHERE task_id=?",
+            (json.dumps(steps), _now_iso(), task_id),
+        )
+        self._conn.commit()
+
     def save_correlation(
         self, correlation_id: str, task_id: str, step_index: int
     ) -> None:

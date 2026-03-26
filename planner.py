@@ -70,6 +70,10 @@ Rules:
   (e.g. "Tesla" after "What car do you drive?" = user drives a Tesla). Never treat a
   contextual reply as a standalone goal.
 - Only use capabilities from the provided list; use concrete input_data (no placeholders).
+  CRITICAL: the `capability` field must be the capability identifier shown indented under
+  the agent header — e.g. `execute_code`, NOT the agent name `code-execution-agent`.
+  Agent names appear in brackets like `[code-execution-agent]` and are never valid
+  capability values. Using an agent name will cause the step to fail.
 - Steps run sequentially. Reference earlier outputs with {{steps[N].output.field}} (0-indexed).
 - Keep step count minimal.
 - Resolve relative dates against CURRENT_UTC. schedule_task.scheduled_at must be ISO 8601 UTC in the future.
@@ -1193,6 +1197,14 @@ class TaskPlanner:
 
         steps: list[WorkflowStep] = []
         for i, step_d in enumerate(plan_dict.get("steps", []), 1):
+            raw_confidence = step_d.get("confidence", 1.0)
+            try:
+                confidence = float(raw_confidence)
+                confidence = max(0.0, min(1.0, confidence))
+            except (TypeError, ValueError):
+                confidence = 1.0
+            raw_mode = str(step_d.get("execution_mode", "")).strip().lower()
+            execution_mode = raw_mode if raw_mode in ("strict", "emergent") else "strict"
             steps.append(
                 WorkflowStep.create(
                     order=i,
@@ -1201,6 +1213,8 @@ class TaskPlanner:
                     description=step_d.get("description", ""),
                     capability=step_d.get("capability", ""),
                     input_data=step_d.get("input_data", {}),
+                    confidence=confidence,
+                    execution_mode=execution_mode,
                 )
             )
 
