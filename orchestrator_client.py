@@ -469,6 +469,18 @@ REGISTRATION_PAYLOAD: dict = {
             ),
             "default": 6,
         },
+        {
+            "key": "planner_emergent_only",
+            "label": "Emergent-Only Execution",
+            "type": "boolean",
+            "required": False,
+            "description": (
+                "When enabled, ALL steps are routed through the emergent tool-loop "
+                "runner regardless of their execution_mode. Takes priority over "
+                "hybrid execution when both are true. Default: false."
+            ),
+            "default": False,
+        },
     ],
 }
 
@@ -545,6 +557,7 @@ class OrchestratorClient:
         self._registered_prompt: str = ""
         self._max_replan_attempts: int = MAX_REPLAN_ATTEMPTS
         self._hybrid_execution: bool = False
+        self._emergent_only: bool = False
         self._emergent_max_turns: int = 6
         self._plan_tracker: PlanTracker = PlanTracker()
 
@@ -731,6 +744,7 @@ class OrchestratorClient:
                 "planner_max_replan_attempts",
                 "planner_hybrid_execution",
                 "planner_emergent_max_turns",
+                "planner_emergent_only",
             ):
                 if k in settings:
                     self._agent_settings[k] = settings[k]
@@ -1176,6 +1190,14 @@ class OrchestratorClient:
             return
 
         step       = steps[step_index]
+
+        # Emergent-only mode: route every step through the tool-loop runner
+        if self._emergent_only:
+            asyncio.create_task(
+                self._dispatch_emergent_step(ws, task_id, step_index),
+                name=f"emergent-only-{task_id[:8]}-{step_index}",
+            )
+            return
 
         # Route emergent steps to the tool-loop runner when hybrid mode is active
         if self._hybrid_execution and step.get("execution_mode") == "emergent":
@@ -2282,6 +2304,10 @@ class OrchestratorClient:
                 logger.info("Emergent max turns → %d", self._emergent_max_turns)
             except (ValueError, TypeError):
                 pass
+        if "planner_emergent_only" in settings:
+            raw = str(settings["planner_emergent_only"]).lower().strip()
+            self._emergent_only = raw in ("true", "1", "yes")
+            logger.info("Emergent-only execution → %s", self._emergent_only)
 
     def _make_emergent_runner(self) -> EmergentStepRunner:
         """Build an EmergentStepRunner wired to this client's infrastructure."""
@@ -2298,21 +2324,76 @@ class OrchestratorClient:
         )
 
     async def _list_capabilities_for_emergent(self) -> list[dict]:
-        """Fetch live capability list for the emergent runner's tool catalogue."""
+        """
+        Fetch the live capability catalogue for the emergent runner.
+
+        Uses the same two-step pattern as TaskPlanner.discover_capabilities():
+          1. GET /api/v1/agents?active=true  — AgentSummary list (names/ids only)
+          2. GET /api/v1/agents/{id}          — full AgentRecord with input schemas
+
+        GET /api/v1/agents returns AgentSummary which only contains
+        capability_names (strings), NOT the full schema objects.  Without the
+        second fetch the emergent runner would see an empty catalogue and
+        immediately return "no capabilities available".
+
+        Reuses the planner's in-memory cache when it is fresh (< 60 s) to avoid
+        duplicate REST calls when planning and emergent execution happen close
+        together.
+        """
         _HIDDEN = {"task-planner-agent", "task-executor-agent", "avatar-agent"}
-        try:
-            resp = await self._http.get(f"{self._base}/api/v1/agents")
-            if resp.status_code == 200:
-                agents = resp.json().get("agents", [])
+
+        # ── Reuse planner's cache if fresh ────────────────────────────────────
+        if self._planner is not None:
+            import time as _time
+            cache_age = _time.monotonic() - self._planner._caps_cache_time
+            if cache_age < 60.0 and self._planner._caps_cache:
                 caps: list[dict] = []
-                for agent in agents:
+                for agent in self._planner._caps_cache:
                     if agent.get("name") in _HIDDEN:
                         continue
                     for cap in agent.get("capabilities", []):
                         caps.append(cap)
+                logger.debug(
+                    "EmergentRunner: reused planner capability cache "
+                    "(age=%.1fs, %d cap(s))", cache_age, len(caps)
+                )
+                return caps
+
+        # ── Fresh two-step fetch ──────────────────────────────────────────────
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                list_resp = await http.get(
+                    f"{self._base}/api/v1/agents",
+                    params={"active": "true"},
+                )
+                if list_resp.status_code != 200:
+                    logger.warning(
+                        "list_capabilities_for_emergent: agents list returned %d",
+                        list_resp.status_code,
+                    )
+                    return []
+
+                agent_summaries = list_resp.json()
+                caps = []
+                for summary in agent_summaries:
+                    if summary.get("name") in _HIDDEN:
+                        continue
+                    agent_id = summary.get("id")
+                    if not agent_id:
+                        continue
+                    detail_resp = await http.get(f"{self._base}/api/v1/agents/{agent_id}")
+                    if detail_resp.status_code == 200:
+                        agent = detail_resp.json()
+                        for cap in agent.get("capabilities", []):
+                            caps.append(cap)
+
+                logger.info(
+                    "EmergentRunner: fetched capability catalogue — %d cap(s) from %d agent(s)",
+                    len(caps), len(agent_summaries),
+                )
                 return caps
         except Exception as exc:
-            logger.debug("list_capabilities_for_emergent failed: %s", exc)
+            logger.warning("list_capabilities_for_emergent failed: %s", exc)
         return []
 
     async def _emergent_send_task(
