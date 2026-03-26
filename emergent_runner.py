@@ -22,36 +22,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# ── System prompt for the emergent tool loop ──────────────────────────────────
+# ── Load system prompt from prompts/ directory ────────────────────────────────
 
-_EMERGENT_SYSTEM = """\
-You are an adaptive task executor. You have a goal and a list of available
-capabilities. Reason step-by-step and call capabilities in sequence until the
-goal is fully achieved.
+_PROMPT_PATH = Path(__file__).parent / "prompts" / "emergent_prompt.md"
 
-At each turn output EXACTLY ONE of:
-1. A tool call (to invoke a capability):
-   {"action": "tool_call", "capability": "<name>", "input_data": {...}, "reason": "<why>"}
-
-2. A final answer (when the goal is done):
-   {"action": "done", "output": {...}, "summary": "<one-sentence result>"}
-
-Rules:
-- Use only capabilities from the provided catalogue.
-- Pass concrete values in input_data — never placeholders.
-- Reference prior tool results as needed (they are included in the context).
-- Emit "done" as soon as you have a usable result — do not over-call.
-- If a capability returns an error, try a different approach (different capability
-  or adjusted input_data) up to the turn limit.
-- Output valid JSON only — no preamble, no markdown fences.
-"""
+def _load_system_prompt() -> str:
+    try:
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not load emergent_prompt.md: %s — using built-in fallback", exc)
+        return (
+            "You are an adaptive task executor. Call capabilities to achieve the goal. "
+            'Output {"action":"tool_call",...} or {"action":"done",...} or {"action":"ask",...}. '
+            "JSON only — no extra text."
+        )
 
 _MAX_TURNS_DEFAULT = 6
 _STEP_TIMEOUT_S    = 120.0   # per-capability call inside the tool loop
@@ -138,8 +129,11 @@ class EmergentStepRunner:
 
         logger.info("EmergentRunner: starting step %r (max_turns=%d)", step_name, self._max_turns)
 
+        system_prompt = _load_system_prompt()
+
         for turn in range(self._max_turns):
-            response_text = await self._llm_call(messages)
+            response_text = await self._llm_call(messages, system_prompt)
+            logger.info("EmergentRunner LLM request: %r ", messages)
 
             parsed = _parse_json(response_text)
             if parsed is None:
@@ -159,6 +153,39 @@ class EmergentStepRunner:
                 output["_emergent_summary"] = summary
                 output["_emergent_turns"]   = turn + 1
                 return output
+
+            if action == "ask":
+                questions = parsed.get("questions") or []
+                reason    = parsed.get("reason", "")
+                logger.info(
+                    "EmergentRunner turn %d: LLM asking follow-up (%d question(s)) — %s",
+                    turn + 1, len(questions), reason,
+                )
+                # Surface questions via the ask_user capability if available,
+                # otherwise encode them as a structured output so PlanTracker
+                # can decide whether to escalate or local_replan.
+                ask_result = await self._call_capability(
+                    "ask_user",
+                    {"questions": questions, "reason": reason},
+                )
+                messages.append({"role": "assistant", "content": response_text})
+                if "error" in ask_result:
+                    # ask_user not available — treat unanswered questions as blocker
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"ask_user capability is not available. "
+                            f"Try to infer reasonable defaults for: {questions}. "
+                            "Proceed with your best guess and note any assumptions in the output."
+                        ),
+                    })
+                else:
+                    answers_json = json.dumps(ask_result, ensure_ascii=False, default=str)
+                    messages.append({
+                        "role": "user",
+                        "content": f"User answered your questions:\n{answers_json}\n\nNow continue working toward the goal.",
+                    })
+                continue
 
             if action == "tool_call":
                 capability = parsed.get("capability", "")
@@ -189,7 +216,7 @@ class EmergentStepRunner:
             messages.append({"role": "assistant", "content": response_text})
             messages.append({
                 "role": "user",
-                "content": 'Invalid response. Output only {"action": "tool_call", ...} or {"action": "done", ...}.',
+                "content": 'Invalid response. Output {"action":"tool_call",...}, {"action":"ask",...}, or {"action":"done",...}.',
             })
 
         raise RuntimeError(
@@ -198,12 +225,12 @@ class EmergentStepRunner:
 
     # ── LLM call ──────────────────────────────────────────────────────────────
 
-    async def _llm_call(self, messages: list[dict]) -> str:
+    async def _llm_call(self, messages: list[dict], system_prompt: str) -> str:
         payload = {
             "provider":   self._provider,
             "model":      self._model,
             "messages":   messages,
-            "system":     _EMERGENT_SYSTEM,
+            "system":     system_prompt,
             "max_tokens": 1024,
         }
         async with httpx.AsyncClient(timeout=120) as client:
